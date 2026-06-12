@@ -2,7 +2,8 @@
 /**
  * Rahausub APK REST API
  * Deploy to: api.rahausub.com.ng/api.php
- * Usage: https://api.rahausub.com.ng/api.php?action=XXX
+ * Usage:     https://api.rahausub.com.ng/api.php?action=XXX
+ * Payment:   PaymentPoint (api.paymentpoint.co) — Palmpay + Opay virtual accounts
  */
 
 header('Content-Type: application/json');
@@ -40,12 +41,19 @@ function api_error($message, $code = 400) {
 function verify_token($conn, $incoming_token) {
     if (empty($incoming_token)) return null;
     $ts = mysqli_real_escape_string($conn, $incoming_token);
-    $q  = mysqli_query($conn, "SELECT * FROM users_tbl WHERE token = '$ts' AND status = 1 LIMIT 1");
+    // Direct token lookup (current format — plain hex token stored as-is)
+    $q = mysqli_query($conn,
+        "SELECT id, email, sname, oname, phone, bvn, nin, token, admin_role,
+                super_admin, referal_token, wallet_balance, acc_no, bank_name, acc_name,
+                acc_no2, bank_name2, acc_name2, pin, finger, password, status
+           FROM users_tbl
+          WHERE token = '$ts' AND status = 1 LIMIT 1");
     if ($q && mysqli_num_rows($q) > 0) return mysqli_fetch_assoc($q);
-    // Legacy bcrypt fallback
+    // Legacy bcrypt fallback (old login.php stored bcrypt hash as token)
     $q2 = mysqli_query($conn,
-        "SELECT id, email, sname, oname, phone, bvn, token, monnify_account_details, admin_role,
-                super_admin, referal_token, wallet_balance, acc_no, bank_name, acc_name
+        "SELECT id, email, sname, oname, phone, bvn, nin, token, admin_role,
+                super_admin, referal_token, wallet_balance, acc_no, bank_name, acc_name,
+                acc_no2, bank_name2, acc_name2, pin, finger, password, status
            FROM users_tbl
           WHERE token LIKE '\$2y\$%' AND status = 1
           ORDER BY id DESC LIMIT 200");
@@ -72,137 +80,104 @@ function require_auth($conn) {
     return $user;
 }
 
-// ── Monnify helpers ───────────────────────────────────────────────────────────
-function monnify_get_credentials($conn) {
-    $q    = mysqli_query($conn, "SELECT setting_key, setting_value FROM edutech_settings WHERE setting_key LIKE 'MONNIFY_%'");
-    $keys = [];
-    while ($r = mysqli_fetch_assoc($q)) $keys[$r['setting_key']] = $r['setting_value'];
-    return [
-        'api_key'    => $keys['MONNIFY_API_KEY']      ?? '',
-        'api_secret' => $keys['MONNIFY_API_SECRET']   ?? '',
-        'base_url'   => rtrim($keys['MONNIFY_BASE_URL'] ?? 'https://api.monnify.com', '/'),
-        'contract'   => $keys['MONNIFY_API_CONTRACT'] ?? '',
-    ];
-}
+// ── PaymentPoint virtual account helpers ─────────────────────────────────────
+function pp_create_account($conn, $email, $name, $phone) {
+    $apiSecret  = 'f243601a0abd0415faac1ba6ac78e100d831e33b9ae37b1db6163aceb30dee221eb59362b4103594cf680e96b0e6135efeb7f3e2046c001cd38fb962';
+    $apiKey     = '725058f9c9f42ab1aef6c962286bd449af78c43b';
+    $businessId = 'a65e1352032347a56134852409d3996e4819f891';
 
-function monnify_login($creds) {
-    $ch = curl_init();
-    curl_setopt_array($ch, [
-        CURLOPT_URL            => $creds['base_url'] . '/api/v1/auth/login',
-        CURLOPT_POST           => true,
-        CURLOPT_POSTFIELDS     => '',
-        CURLOPT_HTTPHEADER     => [
-            'Authorization: Basic ' . base64_encode($creds['api_key'] . ':' . $creds['api_secret']),
-            'Content-Type: application/json',
-        ],
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => 15,
-        CURLOPT_SSL_VERIFYPEER => false,
+    // Normalise phone to exactly 11 digits
+    $phoneDigits = preg_replace('/\D+/', '', (string)$phone);
+    if (strlen($phoneDigits) < 11) {
+        $phoneDigits .= substr((string)random_int(100000000, 999999999), 0, 11 - strlen($phoneDigits));
+    } elseif (strlen($phoneDigits) > 11) {
+        $phoneDigits = substr($phoneDigits, 0, 11);
+    }
+
+    $payload = json_encode([
+        'email'      => $email,
+        'name'       => $name,
+        'phoneNumber'=> $phoneDigits,
+        'bankCode'   => ['20946', '20897'], // Palmpay + Opay
+        'businessId' => $businessId,
     ]);
-    $resp = curl_exec($ch);
-    curl_close($ch);
-    $data = json_decode($resp, true);
-    return $data['responseBody']['accessToken'] ?? null;
-}
-
-function monnify_create_reserved_account($conn, $email, $fullName, $userId, $bvn = '', $nin = '') {
-    $creds = monnify_get_credentials($conn);
-    if (empty($creds['api_key']) || empty($creds['contract'])) {
-        return ['success' => false, 'message' => 'Monnify credentials not configured'];
-    }
-    if (empty($bvn) && empty($nin)) {
-        return ['success' => false, 'message' => 'BVN or NIN is required to generate a virtual account'];
-    }
-
-    $token = monnify_login($creds);
-    if (!$token) return ['success' => false, 'message' => 'Monnify authentication failed'];
-
-    $accountRef = 'RAHASUB_' . intval($userId) . '_' . time();
-    $payloadArr = [
-        'accountReference'    => $accountRef,
-        'accountName'         => $fullName,
-        'currencyCode'        => 'NGN',
-        'contractCode'        => $creds['contract'],
-        'customerEmail'       => $email,
-        'customerName'        => $fullName,
-        'getAllAvailableBanks' => true,
-    ];
-    if (!empty($bvn)) $payloadArr['bvn'] = $bvn;
-    if (!empty($nin)) $payloadArr['nin'] = $nin;
-    $payload = json_encode($payloadArr);
 
     $ch = curl_init();
     curl_setopt_array($ch, [
-        CURLOPT_URL            => $creds['base_url'] . '/api/v2/bank-transfer/reserved-accounts',
+        CURLOPT_URL            => 'https://api.paymentpoint.co/api/v1/createVirtualAccount',
+        CURLOPT_RETURNTRANSFER => true,
         CURLOPT_POST           => true,
         CURLOPT_POSTFIELDS     => $payload,
         CURLOPT_HTTPHEADER     => [
-            'Authorization: Bearer ' . $token,
+            'Authorization: Bearer ' . $apiSecret,
             'Content-Type: application/json',
+            'api-key: ' . $apiKey,
         ],
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => 30,
+        CURLOPT_TIMEOUT        => 60,
         CURLOPT_SSL_VERIFYPEER => false,
     ]);
-    $resp = curl_exec($ch);
-    $err  = curl_error($ch);
+    $response  = curl_exec($ch);
+    $curlError = curl_error($ch);
     curl_close($ch);
 
-    if ($err) return ['success' => false, 'message' => 'cURL error: ' . $err];
+    if ($curlError) return ['success' => false, 'message' => 'Connection error: ' . $curlError];
 
-    $data = json_decode($resp, true);
-    if (empty($data['requestSuccessful'])) {
-        return [
-            'success'      => false,
-            'message'      => $data['responseMessage'] ?? 'Monnify account creation failed',
-            'raw_response' => $resp,
-        ];
+    $result = json_decode($response, true);
+    if (!isset($result['status']) || $result['status'] !== 'success') {
+        return ['success' => false, 'message' => 'PaymentPoint error: ' . ($result['message'] ?? $response)];
     }
 
-    $body     = $data['responseBody'] ?? [];
-    $accounts = $body['accounts'] ?? [];
-    $accName  = $body['accountName'] ?? $fullName;
+    $bankAccounts = $result['bankAccounts'] ?? [];
+    $account1     = $bankAccounts[0] ?? null;
+    $account2     = $bankAccounts[1] ?? null;
 
-    $parts = [];
-    foreach ($accounts as $acct) {
-        $bankName = $acct['bankName']      ?? '';
-        $accNum   = $acct['accountNumber'] ?? '';
-        if ($bankName && $accNum) {
-            $parts[] = "$bankName - $accNum - $accName";
-        }
+    $em     = mysqli_real_escape_string($conn, $email);
+    $updates = [];
+    if ($account1) {
+        $updates[] = "acc_no='"    . mysqli_real_escape_string($conn, $account1['accountNumber'] ?? '') . "'";
+        $updates[] = "bank_name='" . mysqli_real_escape_string($conn, $account1['bankName']      ?? '') . "'";
+        $updates[] = "acc_name='"  . mysqli_real_escape_string($conn, $account1['accountName']   ?? '') . "'";
     }
-
-    $detailsStr = implode(', ', $parts);
-    $em  = mysqli_real_escape_string($conn, $email);
-    $ds  = mysqli_real_escape_string($conn, $detailsStr);
-    mysqli_query($conn, "UPDATE users_tbl SET monnify_account_details='$ds' WHERE email='$em'");
+    if ($account2) {
+        $updates[] = "acc_no2='"    . mysqli_real_escape_string($conn, $account2['accountNumber'] ?? '') . "'";
+        $updates[] = "bank_name2='" . mysqli_real_escape_string($conn, $account2['bankName']      ?? '') . "'";
+        $updates[] = "acc_name2='"  . mysqli_real_escape_string($conn, $account2['accountName']   ?? '') . "'";
+    }
+    if ($updates) {
+        mysqli_query($conn, "UPDATE users_tbl SET " . implode(', ', $updates) . " WHERE email='$em'");
+    }
 
     return [
-        'success'  => !empty($parts),
-        'accounts' => $accounts,
-        'raw'      => $detailsStr,
-        'message'  => !empty($parts) ? 'Account generated' : 'No accounts returned by Monnify',
+        'success'   => true,
+        'accounts'  => $bankAccounts,
+        'account1'  => $account1,
+        'account2'  => $account2,
+        'message'   => 'Virtual account generated',
     ];
 }
 
-function parse_monnify_accounts($rawStr) {
+function pp_get_accounts($user) {
     $accounts = [];
-    if (empty($rawStr)) return $accounts;
-    foreach (explode(', ', $rawStr) as $acct) {
-        $p = explode(' - ', trim($acct));
-        if (count($p) >= 2) {
-            $accounts[] = [
-                'provider'       => 'Monnify',
-                'bank_name'      => trim($p[0]),
-                'account_number' => trim($p[1]),
-                'account_name'   => trim($p[2] ?? ''),
-            ];
-        }
+    if (!empty($user['acc_no'])) {
+        $accounts[] = [
+            'provider'       => 'PaymentPoint',
+            'bank_name'      => $user['bank_name']  ?? '',
+            'account_number' => $user['acc_no']     ?? '',
+            'account_name'   => $user['acc_name']   ?? '',
+        ];
+    }
+    if (!empty($user['acc_no2'])) {
+        $accounts[] = [
+            'provider'       => 'PaymentPoint',
+            'bank_name'      => $user['bank_name2'] ?? '',
+            'account_number' => $user['acc_no2']    ?? '',
+            'account_name'   => $user['acc_name2']  ?? '',
+        ];
     }
     return $accounts;
 }
 
-// ── Ensure required tables exist ──────────────────────────────────────────────
+// ── Ensure required tables exist (lightweight check) ─────────────────────────
 function ensure_tables($conn) {
     mysqli_query($conn, "CREATE TABLE IF NOT EXISTS notifications_tbl (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -216,7 +191,6 @@ function ensure_tables($conn) {
         status TINYINT(1) DEFAULT 1,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-
     mysqli_query($conn, "CREATE TABLE IF NOT EXISTS device_tokens (
         id INT AUTO_INCREMENT PRIMARY KEY,
         user_id INT NOT NULL,
@@ -228,7 +202,6 @@ function ensure_tables($conn) {
         INDEX idx_email (email),
         INDEX idx_user_id (user_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-
     mysqli_query($conn, "CREATE TABLE IF NOT EXISTS referal_tbl (
         id INT AUTO_INCREMENT PRIMARY KEY,
         referal VARCHAR(255) NOT NULL,
@@ -236,7 +209,6 @@ function ensure_tables($conn) {
         date_refer TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         INDEX idx_referal (referal)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-
     mysqli_query($conn, "CREATE TABLE IF NOT EXISTS referal_earn_transaction_tbl (
         id INT AUTO_INCREMENT PRIMARY KEY,
         referal_email VARCHAR(255) NOT NULL,
@@ -261,7 +233,7 @@ switch ($action) {
 // ── HEALTH ────────────────────────────────────────────────────────────────────
 case 'health':
 case 'ping':
-    api_response(['message' => 'Rahausub API is running', 'version' => '1.0', 'provider' => 'Monnify', 'time' => date('Y-m-d H:i:s')]);
+    api_response(['message' => 'Rahausub API is running', 'version' => '1.0', 'provider' => 'PaymentPoint', 'time' => date('Y-m-d H:i:s')]);
     break;
 
 // ── LOGIN ─────────────────────────────────────────────────────────────────────
@@ -285,6 +257,9 @@ case 'login':
     $wq  = mysqli_query($conn, "SELECT balance FROM wallet_tbl WHERE user_id = '$em' LIMIT 1");
     $bal = ($wq && mysqli_num_rows($wq) > 0) ? floatval(mysqli_fetch_assoc($wq)['balance']) : 0;
 
+    $accounts = pp_get_accounts($user);
+    $primary  = $accounts[0] ?? null;
+
     api_response([
         'token'          => $api_token,
         'id'             => $user['id'],
@@ -295,6 +270,11 @@ case 'login':
         'admin_role'     => $user['admin_role'],
         'wallet_balance' => $bal,
         'haspin'         => !empty($user['pin']),
+        'finger'         => (bool)(int)($user['finger'] ?? 0),
+        'has_account'    => !empty($accounts),
+        'acc_no'         => $primary['account_number'] ?? '',
+        'bank_name'      => $primary['bank_name'] ?? '',
+        'acc_name'       => $primary['account_name'] ?? '',
     ]);
     break;
 
@@ -333,8 +313,6 @@ case 'register':
     );
     if (!$ins) api_error('Registration failed: ' . mysqli_error($conn));
 
-    $newUserId = mysqli_insert_id($conn);
-
     // Create wallet
     mysqli_query($conn, "INSERT INTO wallet_tbl(user_id, balance, status) VALUES('$em', 0, 1)");
 
@@ -350,11 +328,16 @@ case 'register':
 case 'profile':
     $user = require_auth($conn);
     $em   = mysqli_real_escape_string($conn, $user['email']);
-    $wq   = mysqli_query($conn, "SELECT balance FROM wallet_tbl WHERE user_id = '$em' LIMIT 1");
-    $bal  = ($wq && mysqli_num_rows($wq) > 0) ? floatval(mysqli_fetch_assoc($wq)['balance']) : 0;
 
-    $mAccounts = parse_monnify_accounts($user['monnify_account_details'] ?? '');
-    $primary   = $mAccounts[0] ?? null;
+    // Refresh user data
+    $uq = mysqli_query($conn, "SELECT * FROM users_tbl WHERE email='$em' LIMIT 1");
+    if ($uq) $user = mysqli_fetch_assoc($uq) ?: $user;
+
+    $wq  = mysqli_query($conn, "SELECT balance FROM wallet_tbl WHERE user_id = '$em' LIMIT 1");
+    $bal = ($wq && mysqli_num_rows($wq) > 0) ? floatval(mysqli_fetch_assoc($wq)['balance']) : 0;
+
+    $accounts = pp_get_accounts($user);
+    $primary  = $accounts[0] ?? null;
 
     api_response([
         'id'             => $user['id'],
@@ -362,18 +345,21 @@ case 'profile':
         'sname'          => $user['sname'],
         'oname'          => $user['oname'],
         'phone'          => $user['phone'],
-        'state'          => $user['state'],
-        'admin_role'     => $user['admin_role'],
-        'super_admin'    => $user['super_admin'],
-        'referral_code'  => $user['referal_token'],
-        'referral_link'  => 'https://rahausub.com.ng/easyfinder/dashboard/register?join_with_referal=' . $user['referal_token'],
+        'state'          => $user['state'] ?? '',
+        'admin_role'     => $user['admin_role'] ?? 0,
+        'super_admin'    => $user['super_admin'] ?? 0,
+        'referral_code'  => $user['referal_token'] ?? '',
+        'referral_link'  => 'https://rahausub.com.ng/easyfinder/dashboard/register?join_with_referal=' . ($user['referal_token'] ?? ''),
         'wallet_balance' => $bal,
-        'has_monnify'    => !empty($user['monnify_account_details']),
+        'has_account'    => !empty($accounts),
         'acc_no'         => $primary['account_number'] ?? '',
         'bank_name'      => $primary['bank_name'] ?? '',
         'acc_name'       => $primary['account_name'] ?? '',
+        'accounts'       => $accounts,
         'bvn'            => !empty($user['bvn']) ? '****' . substr($user['bvn'], -4) : null,
-        'kyc_complete'   => (!empty($user['bvn']) || !empty($user['nin'] ?? '')),
+        'has_bvn'        => !empty($user['bvn']),
+        'has_nin'        => !empty($user['nin']),
+        'kyc_complete'   => (!empty($user['bvn']) || !empty($user['nin'])),
     ]);
     break;
 
@@ -392,7 +378,7 @@ case 'wallet_history':
     $em   = mysqli_real_escape_string($conn, $user['email']);
     $q    = mysqli_query($conn, "SELECT * FROM wallet_history_tbl WHERE email = '$em' ORDER BY id DESC LIMIT 50");
     $rows = [];
-    while ($r = mysqli_fetch_assoc($q)) $rows[] = $r;
+    if ($q) while ($r = mysqli_fetch_assoc($q)) $rows[] = $r;
     api_response(['transactions' => $rows]);
     break;
 
@@ -402,18 +388,20 @@ case 'transactions':
     $em   = mysqli_real_escape_string($conn, $user['email']);
     $q    = mysqli_query($conn, "SELECT * FROM transactions_tbl WHERE email = '$em' ORDER BY id DESC LIMIT 50");
     $rows = [];
-    while ($row = mysqli_fetch_assoc($q)) {
-        $rows[] = [
-            'id'         => $row['id'],
-            'title'      => $row['product_name'] ?? 'Transaction',
-            'phone'      => $row['phone'] ?? '-',
-            'date'       => $row['transaction_date'] ?? '-',
-            'subtitle'   => ($row['status'] == 1) ? 'Successful' : 'Failed / Refunded',
-            'amount'     => number_format($row['amount'], 0),
-            'status'     => intval($row['status']),
-            'negative'   => $row['status'] == 1,
-            'request_id' => $row['request_id'] ?? '',
-        ];
+    if ($q) {
+        while ($row = mysqli_fetch_assoc($q)) {
+            $rows[] = [
+                'id'         => $row['id'],
+                'title'      => $row['product_name'] ?? 'Transaction',
+                'phone'      => $row['phone'] ?? '-',
+                'date'       => $row['transaction_date'] ?? '-',
+                'subtitle'   => ($row['status'] == 1) ? 'Successful' : 'Failed / Refunded',
+                'amount'     => number_format($row['amount'], 0),
+                'status'     => intval($row['status']),
+                'negative'   => $row['status'] == 1,
+                'request_id' => $row['request_id'] ?? '',
+            ];
+        }
     }
     api_response(['transactions' => $rows]);
     break;
@@ -422,6 +410,10 @@ case 'transactions':
 case 'dashboard_stats':
     $user = require_auth($conn);
     $em   = mysqli_real_escape_string($conn, $user['email']);
+
+    // Refresh user for account info
+    $uq = mysqli_query($conn, "SELECT * FROM users_tbl WHERE email='$em' LIMIT 1");
+    if ($uq) $user = mysqli_fetch_assoc($uq) ?: $user;
 
     $wq  = mysqli_query($conn, "SELECT balance FROM wallet_tbl WHERE user_id = '$em' LIMIT 1");
     $bal = ($wq && mysqli_num_rows($wq) > 0) ? floatval(mysqli_fetch_assoc($wq)['balance']) : 0;
@@ -444,8 +436,8 @@ case 'dashboard_stats':
     );
     $rc = $rq ? intval(mysqli_fetch_assoc($rq)['cnt']) : 0;
 
-    $mAccounts = parse_monnify_accounts($user['monnify_account_details'] ?? '');
-    $primary   = $mAccounts[0] ?? null;
+    $accounts = pp_get_accounts($user);
+    $primary  = $accounts[0] ?? null;
 
     api_response([
         'wallet_balance'       => $bal,
@@ -454,10 +446,11 @@ case 'dashboard_stats':
         'failed_transactions'  => intval($ts['failed']),
         'notifications_count'  => $nc,
         'referral_count'       => $rc,
-        'has_monnify'          => !empty($user['monnify_account_details']),
+        'has_account'          => !empty($accounts),
         'acc_no'               => $primary['account_number'] ?? '',
         'bank_name'            => $primary['bank_name'] ?? '',
         'acc_name'             => $primary['account_name'] ?? '',
+        'accounts'             => $accounts,
     ]);
     break;
 
@@ -466,63 +459,77 @@ case 'funding_accounts':
     $user = require_auth($conn);
     $em   = mysqli_real_escape_string($conn, $user['email']);
 
-    $monnifyRaw = $user['monnify_account_details'] ?? '';
-    $accounts   = parse_monnify_accounts($monnifyRaw);
-    $primary    = $accounts[0] ?? null;
+    // Refresh user
+    $uq = mysqli_query($conn, "SELECT * FROM users_tbl WHERE email='$em' LIMIT 1");
+    if ($uq) $user = mysqli_fetch_assoc($uq) ?: $user;
 
-    $needsBvn = empty($accounts) && empty($user['bvn']);
+    $accounts = pp_get_accounts($user);
+    $primary  = $accounts[0] ?? null;
+    $hasKyc   = !empty($user['bvn']) || !empty($user['nin']);
+    $needsKyc = empty($accounts) && !$hasKyc;
+
     api_response([
         'accounts'       => $accounts,
         'has_accounts'   => count($accounts) > 0,
-        'has_monnify'    => count($accounts) > 0,
-        'monnify_raw'    => $monnifyRaw,
+        'has_account'    => count($accounts) > 0,
         'acc_no'         => $primary['account_number'] ?? '',
         'bank_name'      => $primary['bank_name'] ?? '',
         'acc_name'       => $primary['account_name'] ?? '',
         'account_number' => $primary['account_number'] ?? '',
         'account_name'   => $primary['account_name'] ?? '',
-        'provider'       => 'Monnify',
-        'needs_bvn'      => $needsBvn,
-        'setup_message'  => $needsBvn
+        'provider'       => 'PaymentPoint',
+        'needs_bvn'      => $needsKyc,
+        'setup_message'  => $needsKyc
             ? 'Please submit your BVN via the KYC section to activate your virtual account.'
             : (empty($accounts) ? 'Your account is being set up. Please check back.' : ''),
     ]);
     break;
 
-// ── GENERATE MONNIFY ACCOUNT ──────────────────────────────────────────────────
+// ── GENERATE VIRTUAL ACCOUNT (PaymentPoint) ───────────────────────────────────
+// Action aliases: generate_account | generate_monnify (backward compat)
+case 'generate_account':
 case 'generate_monnify':
     $user = require_auth($conn);
+    $em   = mysqli_real_escape_string($conn, $user['email']);
 
-    if (!empty($user['monnify_account_details'])) {
-        $accounts = parse_monnify_accounts($user['monnify_account_details']);
-        $primary  = $accounts[0] ?? null;
+    // Refresh user
+    $uq = mysqli_query($conn, "SELECT * FROM users_tbl WHERE email='$em' LIMIT 1");
+    if ($uq) $user = mysqli_fetch_assoc($uq) ?: $user;
+
+    $existingAccounts = pp_get_accounts($user);
+    if (count($existingAccounts) >= 2) {
+        $primary = $existingAccounts[0];
         api_response([
             'message'        => 'Account already exists',
-            'accounts'       => $accounts,
-            'acc_no'         => $primary['account_number'] ?? '',
-            'bank_name'      => $primary['bank_name'] ?? '',
-            'acc_name'       => $primary['account_name'] ?? '',
-            'account_number' => $primary['account_number'] ?? '',
-            'account_name'   => $primary['account_name'] ?? '',
+            'accounts'       => $existingAccounts,
+            'acc_no'         => $primary['account_number'],
+            'bank_name'      => $primary['bank_name'],
+            'acc_name'       => $primary['account_name'],
+            'account_number' => $primary['account_number'],
+            'account_name'   => $primary['account_name'],
         ]);
     }
 
-    if (empty($user['bvn']) && empty($user['nin'] ?? '')) {
+    if (empty($user['bvn']) && empty($user['nin'])) {
         api_error('Please submit your BVN or NIN via the KYC section first.', 422);
     }
 
-    $fullName = trim($user['sname'] . ' ' . $user['oname']);
-    $result   = monnify_create_reserved_account($conn, $user['email'], $fullName, $user['id'], $user['bvn'] ?? '', $user['nin'] ?? '');
+    $fullName = trim(($user['sname'] ?? '') . ' ' . ($user['oname'] ?? ''));
+    $result   = pp_create_account($conn, $user['email'], $fullName, $user['phone'] ?? '');
 
     if (!$result['success']) {
-        api_error($result['message'] ?? 'Account generation failed', 422);
+        api_error($result['message'] ?? 'Account generation failed. Please try again.', 422);
     }
 
-    $accounts = parse_monnify_accounts($result['raw']);
-    $primary  = $accounts[0] ?? null;
+    // Re-fetch fresh account data
+    $uq2  = mysqli_query($conn, "SELECT * FROM users_tbl WHERE email='$em' LIMIT 1");
+    $fresh = $uq2 ? (mysqli_fetch_assoc($uq2) ?: $user) : $user;
+    $newAccounts = pp_get_accounts($fresh);
+    $primary = $newAccounts[0] ?? null;
+
     api_response([
-        'message'        => 'Monnify account generated successfully',
-        'accounts'       => $accounts,
+        'message'        => 'Virtual account generated successfully',
+        'accounts'       => $newAccounts,
         'acc_no'         => $primary['account_number'] ?? '',
         'bank_name'      => $primary['bank_name'] ?? '',
         'acc_name'       => $primary['account_name'] ?? '',
@@ -531,17 +538,18 @@ case 'generate_monnify':
     ]);
     break;
 
-// ── VERIFY MONNIFY ACCOUNT ────────────────────────────────────────────────────
+// ── VERIFY ACCOUNT STATUS ─────────────────────────────────────────────────────
+case 'verify_account':
 case 'verify_monnify':
     $user = require_auth($conn);
     $em   = mysqli_real_escape_string($conn, $user['email']);
-    $uq   = mysqli_query($conn, "SELECT monnify_account_details FROM users_tbl WHERE email='$em' LIMIT 1");
-    if ($uq) { $ur = mysqli_fetch_assoc($uq); $user['monnify_account_details'] = $ur['monnify_account_details'] ?? ''; }
+    $uq   = mysqli_query($conn, "SELECT * FROM users_tbl WHERE email='$em' LIMIT 1");
+    if ($uq) $user = mysqli_fetch_assoc($uq) ?: $user;
 
-    $accounts = parse_monnify_accounts($user['monnify_account_details'] ?? '');
+    $accounts = pp_get_accounts($user);
     $primary  = $accounts[0] ?? null;
     api_response([
-        'has_monnify'    => !empty($accounts),
+        'has_account'    => !empty($accounts),
         'accounts'       => $accounts,
         'acc_no'         => $primary['account_number'] ?? '',
         'bank_name'      => $primary['bank_name'] ?? '',
@@ -582,36 +590,43 @@ case 'submit_kyc':
     if (empty($sets)) api_error('BVN and NIN must be 11 digits');
     mysqli_query($conn, "UPDATE users_tbl SET " . implode(', ', $sets) . " WHERE email='$em'");
 
-    $monnifyResult = null;
-    $bvnToUse = !empty($bvn) ? $bvn : ($user['bvn'] ?? '');
-    $ninToUse = !empty($nin) ? $nin : ($user['nin'] ?? '');
-    if ((!empty($bvnToUse) || !empty($ninToUse)) && empty($user['monnify_account_details'])) {
-        $fullName      = trim($user['sname'] . ' ' . $user['oname']);
-        $monnifyResult = monnify_create_reserved_account($conn, $user['email'], $fullName, $user['id'], $bvnToUse, $ninToUse);
+    // Attempt to auto-generate virtual account via PaymentPoint
+    $ppResult = null;
+    $uq = mysqli_query($conn, "SELECT * FROM users_tbl WHERE email='$em' LIMIT 1");
+    $freshUser = $uq ? (mysqli_fetch_assoc($uq) ?: $user) : $user;
+
+    if (empty($freshUser['acc_no'])) {
+        $fullName = trim(($freshUser['sname'] ?? '') . ' ' . ($freshUser['oname'] ?? ''));
+        $ppResult = pp_create_account($conn, $freshUser['email'], $fullName, $freshUser['phone'] ?? '');
     }
 
-    $uq2       = mysqli_query($conn, "SELECT bvn, nin, monnify_account_details FROM users_tbl WHERE email='$em' LIMIT 1");
-    $freshUser = $uq2 ? (mysqli_fetch_assoc($uq2) ?: []) : [];
-    $hasBvnNow    = !empty($freshUser['bvn']);
-    $hasNinNow    = !empty($freshUser['nin']);
-    $hasMonnifyNow = !empty($freshUser['monnify_account_details']);
+    // Re-fetch after account generation
+    $uq2  = mysqli_query($conn, "SELECT * FROM users_tbl WHERE email='$em' LIMIT 1");
+    $fresh = $uq2 ? (mysqli_fetch_assoc($uq2) ?: $freshUser) : $freshUser;
+    $hasBvnNow = !empty($fresh['bvn']);
+    $hasNinNow = !empty($fresh['nin']);
+    $accounts  = pp_get_accounts($fresh);
+    $primary   = $accounts[0] ?? null;
 
-    $setupMsg = $hasMonnifyNow ? '' : 'Generating your virtual account, please check back shortly.';
-    $responseData = ['message' => 'KYC submitted successfully', 'needs_bvn' => !$hasBvnNow && !$hasNinNow, 'setup_message' => $setupMsg];
+    $responseData = [
+        'message'         => 'KYC submitted successfully',
+        'needs_bvn'       => !$hasBvnNow && !$hasNinNow,
+        'setup_message'   => !empty($accounts) ? '' : 'Generating your virtual account, please check back shortly.',
+        'account_ready'   => !empty($accounts),
+        'accounts'        => $accounts,
+        'acc_no'          => $primary['account_number'] ?? '',
+        'bank_name'       => $primary['bank_name'] ?? '',
+        'acc_name'        => $primary['account_name'] ?? '',
+    ];
 
-    if ($monnifyResult && $monnifyResult['success']) {
-        $accounts = parse_monnify_accounts($monnifyResult['raw'] ?? '');
-        $primary  = $accounts[0] ?? null;
-        $responseData['monnify_generated'] = true;
-        $responseData['acc_no']            = $primary['account_number'] ?? '';
-        $responseData['bank_name']         = $primary['bank_name'] ?? '';
-        $responseData['acc_name']          = $primary['account_name'] ?? '';
+    if ($ppResult && $ppResult['success']) {
+        $responseData['account_generated'] = true;
         $responseData['account_number']    = $primary['account_number'] ?? '';
         $responseData['account_name']      = $primary['account_name'] ?? '';
-        $responseData['accounts']          = $accounts;
-    } elseif ($monnifyResult && !$monnifyResult['success']) {
-        $responseData['monnify_error'] = $monnifyResult['message'] ?? 'Account generation failed';
+    } elseif ($ppResult && !$ppResult['success']) {
+        $responseData['account_error'] = $ppResult['message'] ?? 'Account generation failed';
     }
+
     api_response($responseData);
     break;
 
@@ -622,28 +637,27 @@ case 'get_kyc_status':
     $uq   = mysqli_query($conn, "SELECT * FROM users_tbl WHERE email='$em' LIMIT 1");
     if ($uq) $user = mysqli_fetch_assoc($uq) ?: $user;
 
-    $hasBvn     = !empty($user['bvn']);
-    $hasNin     = !empty($user['nin'] ?? '');
-    $hasMonnify = !empty($user['monnify_account_details']);
-    $accounts   = parse_monnify_accounts($user['monnify_account_details'] ?? '');
-    $primary    = $accounts[0] ?? null;
+    $hasBvn   = !empty($user['bvn']);
+    $hasNin   = !empty($user['nin']);
+    $accounts = pp_get_accounts($user);
+    $primary  = $accounts[0] ?? null;
 
     api_response([
         'kyc_complete'   => ($hasBvn || $hasNin),
         'has_bvn'        => $hasBvn,
         'has_nin'        => $hasNin,
-        'has_monnify'    => $hasMonnify,
+        'has_account'    => !empty($accounts),
         'needs_bvn'      => !$hasBvn && !$hasNin,
-        'account_ready'  => $hasMonnify,
+        'account_ready'  => !empty($accounts),
         'account_number' => $primary['account_number'] ?? '',
-        'bank_name'      => $primary['bank_name']      ?? '',
-        'account_name'   => $primary['account_name']   ?? '',
+        'bank_name'      => $primary['bank_name'] ?? '',
+        'account_name'   => $primary['account_name'] ?? '',
         'acc_no'         => $primary['account_number'] ?? '',
-        'acc_name'       => $primary['account_name']   ?? '',
+        'acc_name'       => $primary['account_name'] ?? '',
         'accounts'       => $accounts,
         'setup_message'  => (!$hasBvn && !$hasNin)
             ? 'Submit your BVN or NIN to activate your virtual account.'
-            : ($hasMonnify ? '' : 'Generating your virtual account, please check back shortly.'),
+            : (empty($accounts) ? 'Generating your virtual account, please check back shortly.' : ''),
     ]);
     break;
 
@@ -698,8 +712,8 @@ case 'buy_airtime':
 
     if (!$status) mysqli_query($conn, "UPDATE wallet_tbl SET balance='{$wallet['balance']}' WHERE user_id='$em'");
 
-    $nm  = mysqli_real_escape_string($conn, $number);
-    $rid = mysqli_real_escape_string($conn, $requestId);
+    $nm   = mysqli_real_escape_string($conn, $number);
+    $rid  = mysqli_real_escape_string($conn, $requestId);
     $resJ = mysqli_real_escape_string($conn, json_encode($res));
     mysqli_query($conn, "INSERT INTO transactions_tbl(unique_element,amount,real_amount,email,phone,request_id,product_name,response_description,status,transaction_date,is_bill,our_commission)
         VALUES('$nm','$amount','$amount','$em','$nm','$rid','Airtime Recharge','$resJ'," . ($status ? 1 : 0) . ",NOW(),1,0)");
@@ -879,13 +893,13 @@ case 'get_referral_stats':
     $rq   = mysqli_query($conn,
         "SELECT u.sname, u.oname, u.email, u.date_join
          FROM referal_tbl rt
-         JOIN users_tbl u ON u.email=(SELECT email FROM users_tbl WHERE MD5(email)=rt.referee LIMIT 1)
-         WHERE rt.referal=(SELECT referal_token FROM users_tbl WHERE email='$em' LIMIT 1)
+         JOIN users_tbl u ON u.referal_token = rt.referee
+         WHERE rt.referal = (SELECT referal_token FROM users_tbl WHERE email='$em' LIMIT 1)
          ORDER BY rt.id DESC");
     $referred = [];
     if ($rq) while ($r = mysqli_fetch_assoc($rq)) $referred[] = $r;
     $tq    = mysqli_query($conn, "SELECT COALESCE(SUM(earn_amount),0) as total FROM referal_earn_transaction_tbl WHERE referal_email='$em'");
-    $total = $tq ? intval(mysqli_fetch_assoc($tq)['total'] ?? 0) : 0;
+    $total = $tq ? floatval(mysqli_fetch_assoc($tq)['total'] ?? 0) : 0;
     $refCode = $user['referal_token'] ?? '';
     api_response([
         'referral_code'  => $refCode,
@@ -943,17 +957,18 @@ case 'verify_token':
 
     $ts = mysqli_real_escape_string($conn, $incomingToken);
     $q  = mysqli_query($conn,
-        "SELECT id, sname, oname, email, phone, pin, finger, monnify_account_details
+        "SELECT id, sname, oname, email, phone, pin, finger,
+                acc_no, bank_name, acc_name, acc_no2, bank_name2, acc_name2
            FROM users_tbl
           WHERE token = '$ts' AND status = 1 LIMIT 1");
 
     if ($q && mysqli_num_rows($q) > 0) {
-        $row = mysqli_fetch_assoc($q);
-        $em  = mysqli_real_escape_string($conn, $row['email']);
-        $wq  = mysqli_query($conn, "SELECT balance FROM wallet_tbl WHERE user_id='$em' LIMIT 1");
-        $bal = ($wq && mysqli_num_rows($wq) > 0) ? floatval(mysqli_fetch_assoc($wq)['balance']) : 0;
-        $mAccounts = parse_monnify_accounts($row['monnify_account_details'] ?? '');
-        $primary   = $mAccounts[0] ?? null;
+        $row      = mysqli_fetch_assoc($q);
+        $em       = mysqli_real_escape_string($conn, $row['email']);
+        $wq       = mysqli_query($conn, "SELECT balance FROM wallet_tbl WHERE user_id='$em' LIMIT 1");
+        $bal      = ($wq && mysqli_num_rows($wq) > 0) ? floatval(mysqli_fetch_assoc($wq)['balance']) : 0;
+        $accounts = pp_get_accounts($row);
+        $primary  = $accounts[0] ?? null;
         api_response([
             'valid'          => true,
             'user_id'        => $row['id'],
@@ -961,17 +976,20 @@ case 'verify_token':
             'name'           => trim($row['sname'] . ' ' . $row['oname']),
             'phone'          => $row['phone'],
             'haspin'         => !empty($row['pin']),
-            'finger'         => (bool)$row['finger'],
+            'finger'         => (bool)(int)$row['finger'],
             'wallet_balance' => $bal,
+            'has_account'    => !empty($accounts),
             'acc_no'         => $primary['account_number'] ?? '',
             'bank_name'      => $primary['bank_name'] ?? '',
             'acc_name'       => $primary['account_name'] ?? '',
+            'accounts'       => $accounts,
         ]);
     }
 
     // Legacy bcrypt fallback
     $q2 = mysqli_query($conn,
-        "SELECT id, sname, oname, email, phone, pin, finger, monnify_account_details
+        "SELECT id, sname, oname, email, phone, pin, finger,
+                acc_no, bank_name, acc_name, acc_no2, bank_name2, acc_name2
            FROM users_tbl
           WHERE token LIKE '\$2y\$%' AND status = 1
           ORDER BY id DESC LIMIT 200");
@@ -979,11 +997,11 @@ case 'verify_token':
         while ($row = mysqli_fetch_assoc($q2)) {
             if (password_verify($incomingToken, $row['token'])) {
                 mysqli_query($conn, "UPDATE users_tbl SET token='$ts' WHERE id=" . intval($row['id']));
-                $em  = mysqli_real_escape_string($conn, $row['email']);
-                $wq  = mysqli_query($conn, "SELECT balance FROM wallet_tbl WHERE user_id='$em' LIMIT 1");
-                $bal = ($wq && mysqli_num_rows($wq) > 0) ? floatval(mysqli_fetch_assoc($wq)['balance']) : 0;
-                $mAccounts = parse_monnify_accounts($row['monnify_account_details'] ?? '');
-                $primary   = $mAccounts[0] ?? null;
+                $em       = mysqli_real_escape_string($conn, $row['email']);
+                $wq       = mysqli_query($conn, "SELECT balance FROM wallet_tbl WHERE user_id='$em' LIMIT 1");
+                $bal      = ($wq && mysqli_num_rows($wq) > 0) ? floatval(mysqli_fetch_assoc($wq)['balance']) : 0;
+                $accounts = pp_get_accounts($row);
+                $primary  = $accounts[0] ?? null;
                 api_response([
                     'valid'          => true,
                     'user_id'        => $row['id'],
@@ -991,11 +1009,13 @@ case 'verify_token':
                     'name'           => trim($row['sname'] . ' ' . $row['oname']),
                     'phone'          => $row['phone'],
                     'haspin'         => !empty($row['pin']),
-                    'finger'         => (bool)$row['finger'],
+                    'finger'         => (bool)(int)$row['finger'],
                     'wallet_balance' => $bal,
+                    'has_account'    => !empty($accounts),
                     'acc_no'         => $primary['account_number'] ?? '',
                     'bank_name'      => $primary['bank_name'] ?? '',
                     'acc_name'       => $primary['account_name'] ?? '',
+                    'accounts'       => $accounts,
                 ]);
             }
         }
@@ -1030,8 +1050,9 @@ case 'change_pin':
     api_response(['message' => 'PIN changed successfully']);
     break;
 
+// ── DEFAULT ───────────────────────────────────────────────────────────────────
 default:
-    api_error("Unknown action: '$action'. Available: health, login, register, verify_token, check_fingerprint, toggle_fingerprint, set_pin, change_pin, profile, wallet, wallet_history, transactions, dashboard_stats, funding_accounts, generate_monnify, verify_monnify, submit_kyc, get_kyc_status, buy_airtime, buy_data, data_plans, notifications, get_notifications, get_unread_count, mark_notification_read, mark_all_notifications_read, referral, get_referral_stats, change_password", 404);
+    api_error("Unknown action: '$action'. Available actions: health, login, register, verify_token, check_fingerprint, toggle_fingerprint, set_pin, change_pin, change_password, profile, wallet, wallet_history, transactions, dashboard_stats, funding_accounts, generate_account, verify_account, submit_kyc, get_kyc_status, buy_airtime, buy_data, data_plans, notifications, get_notifications, get_unread_count, mark_notification_read, mark_all_notifications_read, referral, get_referral_stats", 404);
 }
 
 mysqli_close($conn);
