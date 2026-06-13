@@ -729,3 +729,107 @@ All errors follow the same shape:
 | Jun 2026 | Fix `verify_token` — removed invalid `wallet_balance` column reference (was causing 500 on all auth'd endpoints) |
 | Jun 2026 | Replace Monnify with PaymentPoint throughout `api.php` |
 | Jun 2026 | Add KYC (BVN + NIN), referral system, FCM push, admin notification management |
+
+---
+
+## Data Bundle Types (plan_types)
+
+### `data_types` — Get Data Bundle Types for a Network ⭐ NEW
+```
+GET /api.php?action=data_types&serviceID=mtn-data
+```
+No auth required.
+
+**Response:**
+```json
+{
+  "status": "success",
+  "data": {
+    "types": [
+      { "id": 1,  "name": "MTN SME",               "code": "mtnsme"     },
+      { "id": 2,  "name": "MTN Corporate Gifting",  "code": "mtncg"      },
+      { "id": 7,  "name": "MTN Awoof",              "code": "mtnawoof"   },
+      { "id": 9,  "name": "DATA SHARE",             "code": "mtnshare"   },
+      { "id": 10, "name": "DATA COUPONS",           "code": "mtncoupons" },
+      { "id": 11, "name": "MTN SME 2",              "code": "mtnsme2"    },
+      { "id": 12, "name": "MTN SMS",                "code": "mtn-sms"    }
+    ]
+  }
+}
+```
+> Use `id` from this response as `plan_id` when calling `other_data_plans`.
+
+---
+
+### `other_data_plans` — Get Plans for a Data Type ⭐ NEW
+```
+GET /api.php?action=other_data_plans&plan_id=1
+```
+No auth required. `plan_id` = `id` from `data_types` response.
+
+**Response:**
+```json
+{
+  "status": "success",
+  "data": {
+    "plans": [
+      {
+        "id": 149,
+        "plan_id": "7",
+        "api_id": 4,
+        "name": "MTN SME 1GB (7 Days)",
+        "validity": "7 Days",
+        "amount": 430
+      }
+    ]
+  }
+}
+```
+> Use `id` (not `plan_id`) when calling `buy_other_data`.
+
+---
+
+### `buy_other_data` — Purchase Data Bundle (non-VTpass) ⭐ NEW
+```
+POST /api.php?action=buy_other_data
+Authorization: Bearer TOKEN
+Content-Type: application/json
+```
+**Request body:**
+```json
+{
+  "number":  "08012345678",
+  "plan_id": 149,
+  "pin":     "1234"
+}
+```
+> Set `pin` to `"fingerprint"` for biometric auth.
+
+**Response:**
+```json
+{
+  "status": "success",
+  "data": {
+    "success":  true,
+    "message":  "Data purchase successful",
+    "balance":  4570.00,
+    "api_response": { ... }
+  }
+}
+```
+
+---
+
+## Typical Data Bundle Flow
+
+```
+1. GET  ?action=data_types&serviceID=mtn-data      → pick a type (get id)
+2. GET  ?action=other_data_plans&plan_id={id}      → pick a plan (get plan.id)
+3. POST ?action=buy_other_data                     → purchase
+   body: { number, plan_id, pin }
+```
+
+Also works with legacy standalone endpoints:
+- `POST /getDataTypes.php`  — same data, requires token in body
+- `POST /getOtherData.php`  — requires token + plan_id in body
+- `POST /buyOtherData.php`  — requires token + number + plan_id + pin
