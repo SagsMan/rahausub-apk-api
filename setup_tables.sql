@@ -107,3 +107,17 @@ ALTER TABLE users_tbl ADD COLUMN IF NOT EXISTS referal_token VARCHAR(100) NULL;
 ALTER TABLE users_tbl ADD COLUMN IF NOT EXISTS token TEXT NULL;
 ALTER TABLE users_tbl ADD COLUMN IF NOT EXISTS monnify_account_details TEXT NULL;
 ALTER TABLE users_tbl ADD COLUMN IF NOT EXISTS date_join TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+-- ── plan_types — MTN data bundle types ────────────────────────────────────────
+-- Run these to ensure all MTN types are present and active (safe to re-run)
+INSERT IGNORE INTO plan_types (id, data_type, title, network_id, status) VALUES
+  (1,  'mtnsme',     'MTN SME',               1, 1),
+  (2,  'mtncg',      'MTN Corporate Gifting',  1, 1),
+  (7,  'mtnawoof',   'MTN Awoof',              1, 1),
+  (9,  'mtnshare',   'DATA SHARE',             1, 1),
+  (10, 'mtncoupons', 'DATA COUPONS',           1, 1),
+  (11, 'mtnsme2',    'MTN SME 2',              1, 1),
+  (12, 'mtn-sms',    'MTN SMS',                1, 1);
+
+-- Activate any that were disabled
+UPDATE plan_types SET status=1 WHERE network_id=1 AND id IN (1,2,7,9,10,11,12);
