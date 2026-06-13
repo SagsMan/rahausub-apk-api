@@ -66,8 +66,13 @@ function verify_token($conn, $incoming_token) {
 }
 
 function get_token_from_request() {
-    return $_SERVER['HTTP_X_API_TOKEN']
-        ?? $_GET['token']
+    // Authorization: Bearer <token>
+    $auth = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
+    if (preg_match('/Bearer\s+(.+)/i', $auth, $m)) return trim($m[1]);
+    // X-API-Token header
+    if (!empty($_SERVER['HTTP_X_API_TOKEN'])) return $_SERVER['HTTP_X_API_TOKEN'];
+    // Query param, POST field, or JSON body
+    return $_GET['token']
         ?? $_POST['token']
         ?? (json_decode(@file_get_contents('php://input'), true)['token'] ?? '');
 }
