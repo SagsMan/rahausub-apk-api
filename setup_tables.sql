@@ -114,10 +114,11 @@ INSERT IGNORE INTO plan_types (id, data_type, title, network_id, status) VALUES
   (1,  'mtnsme',     'MTN SME',               1, 1),
   (2,  'mtncg',      'MTN Corporate Gifting',  1, 1),
   (7,  'mtnawoof',   'MTN Awoof',              1, 1),
-  (9,  'mtnshare',   'DATA SHARE',             1, 1),
-  (10, 'mtncoupons', 'DATA COUPONS',           1, 1),
+  (9,  'mtnshare',   'DATA SHARE',             1, 0),
+  (10, 'mtncoupons', 'DATA COUPONS',           1, 0),
   (11, 'mtnsme2',    'MTN SME 2',              1, 1),
-  (12, 'mtn-sms',    'MTN SMS',                1, 1);
+  (12, 'mtn-sms',    'MTN SMS',                1, 0);
 
 -- Activate any that were disabled
-UPDATE plan_types SET status=1 WHERE network_id=1 AND id IN (1,2,7,9,10,11,12);
+UPDATE plan_types SET status=1 WHERE network_id=1 AND id IN (1,2,7,11);
+UPDATE plan_types SET status=0 WHERE network_id=1 AND id IN (9,10,12);
