@@ -1069,9 +1069,145 @@ case 'change_pin':
     api_response(['message' => 'PIN changed successfully']);
     break;
 
+// ── DATA TYPES (plan_types table) ─────────────────────────────────────────────
+case 'data_types':
+    $serviceID = strtolower(trim($_GET['serviceID'] ?? $_POST['serviceID'] ?? ($body['serviceID'] ?? '')));
+    if (empty($serviceID)) api_error('serviceID required (e.g. mtn-data)');
+
+    $networkMap = ['mtn' => 1, 'glo' => 2, 'etisalat' => 3, '9mobile' => 3, 'airtel' => 4];
+    $prefix     = explode('-', $serviceID)[0];
+    if (!isset($networkMap[$prefix])) api_error('Unsupported network. Use mtn, glo, airtel or etisalat/9mobile');
+    $network_id = $networkMap[$prefix];
+
+    $q     = mysqli_query($conn, "SELECT id, data_type, title FROM plan_types WHERE network_id='$network_id' AND status=1 ORDER BY id");
+    $types = [];
+    while ($r = mysqli_fetch_assoc($q)) {
+        $types[] = ['id' => $r['id'], 'name' => $r['title'], 'code' => $r['data_type']];
+    }
+    if (empty($types)) api_error('No data types found for this network', 404);
+    api_response(['types' => $types]);
+    break;
+
+// ── OTHER DATA PLANS (plans table by plan_type_id) ────────────────────────────
+case 'other_data_plans':
+    $plan_type_id = trim($_GET['plan_id'] ?? $_POST['plan_id'] ?? ($body['plan_id'] ?? ''));
+    if (empty($plan_type_id)) api_error('plan_id (plan_types.id) required');
+    $ptid = (int) $plan_type_id;
+
+    $q     = mysqli_query($conn, "
+        SELECT p.id, p.plan_id, p.plan, p.validity, p.price, p.api_id
+          FROM plans p
+    INNER JOIN api_settings a ON p.api_id = a.id
+         WHERE p.plan_type_id = '$ptid' AND a.is_active = 1
+      ORDER BY p.price ASC
+    ");
+    $plans = [];
+    while ($r = mysqli_fetch_assoc($q)) {
+        $plans[] = [
+            'id'       => $r['id'],
+            'plan_id'  => $r['plan_id'],
+            'api_id'   => $r['api_id'],
+            'name'     => $r['plan'] . ' (' . $r['validity'] . ')',
+            'validity' => $r['validity'],
+            'amount'   => (float) $r['price'],
+        ];
+    }
+    if (empty($plans)) api_error('No plans found for this data type', 404);
+    api_response(['plans' => $plans]);
+    break;
+
+// ── BUY OTHER DATA (Gladtiding / non-VTpass providers) ───────────────────────
+case 'buy_other_data':
+    $user   = require_auth($conn);
+    $number = trim($body['number'] ?? '');
+    $planId = trim($body['plan_id'] ?? '');
+    $pin    = trim($body['pin'] ?? '');
+
+    if (empty($number) || empty($planId) || empty($pin)) api_error('number, plan_id, and pin are required');
+
+    // Verify PIN
+    if ($pin !== 'fingerprint') {
+        if (md5($pin) !== $user['pin']) api_error('Invalid PIN');
+    }
+
+    // Get plan
+    $planQ = mysqli_query($conn, "SELECT id, plan_id, plan, price, api_id, network_id FROM plans WHERE id='" . (int)$planId . "'");
+    $plan  = mysqli_fetch_assoc($planQ);
+    if (!$plan) api_error('Invalid plan');
+
+    $amount = $plan['price'];
+    $em     = $user['email'];
+    $newBal = $user['wallet_balance'] - $amount;
+
+    if ($user['wallet_balance'] < $amount) api_error('Insufficient wallet balance');
+
+    // Deduct wallet
+    mysqli_query($conn, "UPDATE wallet_tbl SET balance='$newBal' WHERE user_id='$em'");
+
+    // Get API
+    $apiQ = mysqli_query($conn, "SELECT * FROM api_settings WHERE id='" . (int)$plan['api_id'] . "' AND is_active=1");
+    $api  = mysqli_fetch_assoc($apiQ);
+    if (!$api) {
+        mysqli_query($conn, "UPDATE wallet_tbl SET balance='" . $user['wallet_balance'] . "' WHERE user_id='$em'");
+        api_error('Provider API not available');
+    }
+
+    // Call provider
+    $payload = json_encode([
+        'network'       => $plan['network_id'],
+        'mobile_number' => $number,
+        'plan'          => $plan['plan_id'],
+        'Ported_number' => true,
+    ]);
+    $ch = curl_init($api['api_url']);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $payload,
+        CURLOPT_HTTPHEADER     => ['Authorization: Token ' . $api['api_key'], 'Content-Type: application/json'],
+        CURLOPT_TIMEOUT        => 30,
+        CURLOPT_SSL_VERIFYPEER => false,
+    ]);
+    $raw = curl_exec($ch);
+    $err = curl_error($ch);
+    curl_close($ch);
+
+    if ($err || !$raw) {
+        mysqli_query($conn, "UPDATE wallet_tbl SET balance='" . $user['wallet_balance'] . "' WHERE user_id='$em'");
+        api_error('Provider API error');
+    }
+
+    $res    = json_decode($raw, true);
+    $status = false;
+    if (isset($res['Status']))  $status = in_array(strtolower($res['Status']), ['successful','success']);
+    elseif (isset($res['status'])) $status = in_array(strtolower($res['status']), ['success','successful']);
+    elseif (isset($res['code'])) $status = ($res['code'] == 200 || strtolower($res['code']) === 'success');
+
+    if (!$status) {
+        mysqli_query($conn, "UPDATE wallet_tbl SET balance='" . $user['wallet_balance'] . "' WHERE user_id='$em'");
+    }
+
+    $txnId    = $res['id'] ?? $res['transaction_id'] ?? uniqid('txn_');
+    $planName = mysqli_real_escape_string($conn, $plan['plan']);
+    $resEsc   = mysqli_real_escape_string($conn, json_encode($res));
+    mysqli_query($conn, "
+        INSERT INTO transactions_tbl
+            (unique_element,amount,real_amount,email,phone,transaction_id,request_id,product_name,response_description,status,transaction_date,is_bill,our_commission)
+        VALUES
+            ('$number','$amount','$amount','$em','$number','$txnId','".uniqid('plan_')."','$planName','$resEsc','".($status?1:0)."',NOW(),1,0)
+    ");
+
+    api_response([
+        'success'      => $status,
+        'message'      => $status ? 'Data purchase successful' : 'Transaction failed, wallet refunded',
+        'balance'      => $status ? $newBal : $user['wallet_balance'],
+        'api_response' => $res,
+    ]);
+    break;
+
 // ── DEFAULT ───────────────────────────────────────────────────────────────────
 default:
-    api_error("Unknown action: '$action'. Available actions: health, login, register, verify_token, check_fingerprint, toggle_fingerprint, set_pin, change_pin, change_password, profile, wallet, wallet_history, transactions, dashboard_stats, funding_accounts, generate_account, verify_account, submit_kyc, get_kyc_status, buy_airtime, buy_data, data_plans, notifications, get_notifications, get_unread_count, mark_notification_read, mark_all_notifications_read, referral, get_referral_stats", 404);
+    api_error("Unknown action: '$action'. Available actions: health, login, register, verify_token, check_fingerprint, toggle_fingerprint, set_pin, change_pin, change_password, profile, wallet, wallet_history, transactions, dashboard_stats, funding_accounts, generate_account, verify_account, submit_kyc, get_kyc_status, buy_airtime, buy_data, data_plans, data_types, other_data_plans, buy_other_data, notifications, get_notifications, get_unread_count, mark_notification_read, mark_all_notifications_read, referral, get_referral_stats", 404);
 }
 
 mysqli_close($conn);
