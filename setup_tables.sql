@@ -122,3 +122,20 @@ INSERT IGNORE INTO plan_types (id, data_type, title, network_id, status) VALUES
 -- Activate any that were disabled
 UPDATE plan_types SET status=1 WHERE network_id=1 AND id IN (1,2,7,11);
 UPDATE plan_types SET status=0 WHERE network_id=1 AND id IN (9,10,12);
+
+-- ── plan_types — GLO, Airtel, 9Mobile bundle types ────────────────────────────
+INSERT IGNORE INTO plan_types (id, data_type, title, network_id, status) VALUES
+  -- GLO (network_id=2)
+  (3,  'glo',         'GLO CG',                    2, 1),
+  (16, 'glosme',      'GLO SME',                   2, 1),
+  (17, 'gloawoof',    'GLO Awoof',                 2, 1),
+  (18, 'glogifting',  'GLO Gifting',               2, 1),
+  -- 9Mobile (network_id=3)
+  (5,  'etisalat',    '9MOBILE CG',                3, 1),
+  (22, '9mobilesme',  '9Mobile SME',               3, 1),
+  (23, '9mobilecg',   '9Mobile Corporate Gifting', 3, 1),
+  -- Airtel (network_id=4)
+  (4,  'airtel',      'AIRTEL CG',                 4, 1),
+  (19, 'airtelsme',   'Airtel SME',                4, 1),
+  (20, 'airtelawoof', 'Airtel Awoof',              4, 1),
+  (21, 'airtelcg',    'Airtel Corporate Gifting',  4, 1);
