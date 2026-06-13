@@ -3,22 +3,27 @@
 > REST API for the **Rahausub** Android/iOS app  
 > Base URL: `https://api.rahausub.com.ng/api.php`  
 > Payment Provider: **PaymentPoint** (Palmpay + Opay virtual accounts)  
-> Push Notifications: **Firebase Cloud Messaging (FCM v1)**
+> Push Notifications: **Firebase Cloud Messaging (FCM v1)**  
+> Webhook: `https://api.rahausub.com.ng/webhook.php`
 
 ---
 
 ## Architecture
 
-Single-file PHP router (`api.php`) — no framework, no Composer. Each feature is a `case` block in one `switch` statement. All endpoints follow the same request/response pattern:
+Single-file PHP router (`api.php`) — no framework, no Composer. Each feature is a `case` block in one `switch` statement.
 
 ```
 GET/POST https://api.rahausub.com.ng/api.php?action=ACTION_NAME
 ```
 
-Auth is via a plain hex token sent in:
-- Query string: `?token=TOKEN`
-- HTTP header: `X-API-Token: TOKEN`
-- JSON body: `{ "token": "TOKEN" }`
+### Authentication — Token Formats (all accepted)
+
+| Format | Example |
+|--------|---------|
+| Bearer header | `Authorization: Bearer TOKEN` ✅ recommended |
+| Custom header | `X-API-Token: TOKEN` |
+| Query param | `?token=TOKEN` |
+| JSON body | `{"token": "TOKEN"}` |
 
 ---
 
@@ -26,41 +31,48 @@ Auth is via a plain hex token sent in:
 
 | File | Description |
 |------|-------------|
-| `api.php` | **Main REST router** — all 25+ actions |
+| `api.php` | **Main REST router** — all actions |
 | `conn.php` | DB connection (mysqli) |
-| `generateBankAccount.php` | PaymentPoint virtual account creator |
-| `getAccountDetails.php` | Standalone account fetch + create |
 | `fcm_helper.php` | Firebase JWT + HTTP v1 push sender |
 | `saveDeviceToken.php` | Register/update FCM device token |
 | `broadcastNotification.php` | Admin: push to all users |
 | `sendPushToUser.php` | Admin: push to specific user by email |
-| `webhook.php` | PaymentPoint webhook — credits wallet on payment |
-| `setup_tables.sql` | One-time DB migration (7 new tables + column additions) |
-| `login.php` | Legacy standalone login endpoint |
-| `register.php` | Legacy standalone register endpoint |
-| `buyAirtime.php` | Legacy standalone airtime endpoint |
-| `buyData.php` | Legacy standalone data endpoint |
+| `webhook.php` | **PaymentPoint webhook** — auto-credits wallet + FCM push on payment |
+| `generateBankAccount.php` | Legacy standalone account creator |
+| `setup_tables.sql` | One-time DB migration |
+| `login.php` | Legacy standalone login |
+| `register.php` | Legacy standalone register |
 | `*.php` | Other legacy standalone endpoints |
 
-> **New development should use `api.php` exclusively.** Legacy files exist for backward compatibility.
+> **New development should use `api.php` exclusively.**
+
+---
+
+## Performance
+
+All endpoints are optimised for **< 0.5 second** response times:
+
+- 7 database indexes added (`token`, `email`, `wallet.user_id`, `device_tokens.email`, etc.)
+- Auth + wallet balance fetched in a **single JOIN query** (was 2 separate queries)
+- Use `action=init` on app startup — returns everything in one call (~390ms)
 
 ---
 
 ## Database Setup (one-time)
 
-Run `setup_tables.sql` on the `eduowrav_rahausub` database. This creates:
+Run `setup_tables.sql` on `eduowrav_rahausub`:
 
 | Table | Purpose |
 |-------|---------|
 | `device_tokens` | FCM push tokens per device |
 | `notifications_tbl` | In-app notifications |
-| `admin_notifications_tbl` | Full admin notification management |
+| `admin_notifications_tbl` | Admin notification management |
 | `admin_notif_delivery_tbl` | Per-user delivery tracking |
 | `admin_notif_api_settings` | Email/SMS channel credentials |
 | `referal_tbl` | Referral relationships |
 | `referal_earn_transaction_tbl` | Referral earnings |
 
-Also adds columns to `users_tbl`: `nin`, `finger`, `referal_token`, `token`, `date_join`
+Also adds to `users_tbl`: `nin`, `finger`, `referal_token`, `token`, `date_join`
 
 ---
 
@@ -70,8 +82,8 @@ Also adds columns to `users_tbl`: `nin`, `finger`, `referal_token`, `token`, `da
 
 ```
 1. POST ?action=register   →  create account
-2. POST ?action=login      →  get token
-3. All other endpoints     →  ?token=TOKEN
+2. POST ?action=login      →  get token  ← save this
+3. All other endpoints     →  Authorization: Bearer TOKEN
 ```
 
 ---
@@ -88,7 +100,7 @@ GET /api.php?action=health
     "message": "Rahausub API is running",
     "version": "1.0",
     "provider": "PaymentPoint",
-    "time": "2026-06-12 08:00:00"
+    "time": "2026-06-13 08:00:00"
   }
 }
 ```
@@ -117,12 +129,10 @@ Content-Type: application/json
 ```json
 {
   "status": "success",
-  "data": {
-    "message": "Registration successful. Please submit your BVN/NIN via the KYC section to activate your virtual account."
-  }
+  "data": { "message": "Registration successful. Please submit your BVN/NIN via the KYC section to activate your virtual account." }
 }
 ```
-> `pin` defaults to `0000` if not provided. `referal` is the referral code of the person who referred this user.
+> `pin` defaults to `0000` if not provided.
 
 ---
 
@@ -133,10 +143,7 @@ Content-Type: application/json
 ```
 **Request body:**
 ```json
-{
-  "email": "user@example.com",
-  "password": "Secret123"
-}
+{ "email": "user@example.com", "password": "Secret123" }
 ```
 **Response:**
 ```json
@@ -149,7 +156,7 @@ Content-Type: application/json
     "sname": "Usman",
     "oname": "Musa",
     "phone": "08012345678",
-    "admin_role": 0,
+    "admin_role": "1,2,3",
     "wallet_balance": 5000.00,
     "haspin": true,
     "finger": false,
@@ -160,13 +167,66 @@ Content-Type: application/json
   }
 }
 ```
-> **Save `token`** — it is required for all authenticated requests.
+> **Save `token`** — required for all authenticated requests.
 
 ---
 
-### `verify_token` — Validate Token (on app start/resume)
+### `init` ⭐ — App Startup (use this instead of profile on open)
 ```
-GET /api.php?action=verify_token&token=TOKEN
+GET /api.php?action=init
+Authorization: Bearer TOKEN
+```
+Returns **everything the home screen needs in one call** (~390ms):
+```json
+{
+  "status": "success",
+  "data": {
+    "id": 42,
+    "email": "user@example.com",
+    "sname": "Mahmud",
+    "oname": "Muhammad",
+    "phone": "08160327173",
+    "state": "Lagos",
+    "admin_role": "1,2,3",
+    "super_admin": 1,
+    "wallet_balance": 90.00,
+    "has_account": true,
+    "acc_no": "6683940358",
+    "bank_name": "Palmpay",
+    "acc_name": "Rahausub-Mah(Paymentpoint)",
+    "accounts": [
+      { "provider": "PaymentPoint", "bank_name": "Palmpay", "account_number": "6683940358", "account_name": "Rahausub-Mah(Paymentpoint)" },
+      { "provider": "PaymentPoint", "bank_name": "Opay",    "account_number": "9876543210", "account_name": "Rahausub-Muh(Paymentpoint)" }
+    ],
+    "unread_count": 3,
+    "referral_code": "3a5a612c02b88c84dfad5d52847767ca",
+    "referral_link": "https://rahausub.com.ng/easyfinder/dashboard/register?join_with_referal=3a5a612c02b88c84dfad5d52847767ca",
+    "bvn": "****12345",
+    "has_bvn": true,
+    "has_nin": false,
+    "kyc_complete": true,
+    "finger": true,
+    "haspin": true
+  }
+}
+```
+> **Use `init` on app open/resume.** It replaces separate calls to `profile`, `wallet`, and `get_unread_count`.
+
+---
+
+### `profile` — Get User Profile
+```
+GET /api.php?action=profile
+Authorization: Bearer TOKEN
+```
+Same response as `init`. Both actions are identical — `init` is the recommended alias.
+
+---
+
+### `verify_token` — Validate Stored Token
+```
+GET /api.php?action=verify_token
+Authorization: Bearer TOKEN
 ```
 **Response:**
 ```json
@@ -184,59 +244,17 @@ GET /api.php?action=verify_token&token=TOKEN
     "has_account": true,
     "acc_no": "8123456789",
     "bank_name": "Palmpay",
-    "acc_name": "Usman Musa",
-    "accounts": [
-      { "provider": "PaymentPoint", "bank_name": "Palmpay", "account_number": "8123456789", "account_name": "Usman Musa" },
-      { "provider": "PaymentPoint", "bank_name": "Opay",    "account_number": "9876543210", "account_name": "Usman Musa" }
-    ]
-  }
-}
-```
-**Error (invalid/expired token):**
-```json
-{ "status": "error", "message": "Invalid or expired token" }
-```
-
----
-
-### `profile` — Get User Profile
-```
-GET /api.php?action=profile&token=TOKEN
-```
-**Response:**
-```json
-{
-  "status": "success",
-  "data": {
-    "id": 42,
-    "email": "user@example.com",
-    "sname": "Usman",
-    "oname": "Musa",
-    "phone": "08012345678",
-    "state": "Kano",
-    "admin_role": 0,
-    "super_admin": 0,
-    "referral_code": "md5hash...",
-    "referral_link": "https://rahausub.com.ng/easyfinder/dashboard/register?join_with_referal=md5hash",
-    "wallet_balance": 5000.00,
-    "has_account": true,
-    "acc_no": "8123456789",
-    "bank_name": "Palmpay",
-    "acc_name": "Usman Musa",
-    "accounts": [ ... ],
-    "bvn": "****12345",
-    "has_bvn": true,
-    "has_nin": false,
-    "kyc_complete": true
+    "acc_name": "Usman Musa"
   }
 }
 ```
 
 ---
 
-### `dashboard_stats` — Dashboard Data
+### `dashboard_stats` — Dashboard Summary
 ```
-GET /api.php?action=dashboard_stats&token=TOKEN
+GET /api.php?action=dashboard_stats
+Authorization: Bearer TOKEN
 ```
 **Response:**
 ```json
@@ -262,9 +280,9 @@ GET /api.php?action=dashboard_stats&token=TOKEN
 
 ### `wallet` — Get Balance
 ```
-GET /api.php?action=wallet&token=TOKEN
+GET /api.php?action=wallet
+Authorization: Bearer TOKEN
 ```
-**Response:**
 ```json
 { "status": "success", "data": { "balance": 5000.00, "email": "user@example.com" } }
 ```
@@ -273,9 +291,9 @@ GET /api.php?action=wallet&token=TOKEN
 
 ### `wallet_history` — Wallet Transaction History
 ```
-GET /api.php?action=wallet_history&token=TOKEN
+GET /api.php?action=wallet_history
+Authorization: Bearer TOKEN
 ```
-**Response:**
 ```json
 { "status": "success", "data": { "transactions": [ { ...wallet record... } ] } }
 ```
@@ -284,7 +302,8 @@ GET /api.php?action=wallet_history&token=TOKEN
 
 ### `transactions` — Service Transaction History
 ```
-GET /api.php?action=transactions&token=TOKEN
+GET /api.php?action=transactions
+Authorization: Bearer TOKEN
 ```
 **Response:**
 ```json
@@ -296,7 +315,7 @@ GET /api.php?action=transactions&token=TOKEN
         "id": 101,
         "title": "MTN 1GB Data",
         "phone": "08012345678",
-        "date": "2026-06-12 08:00:00",
+        "date": "2026-06-13 08:00:00",
         "subtitle": "Successful",
         "amount": "300",
         "status": 1,
@@ -314,17 +333,15 @@ GET /api.php?action=transactions&token=TOKEN
 
 ### `submit_kyc` — Submit BVN and/or NIN
 ```
-POST /api.php?action=submit_kyc&token=TOKEN
+POST /api.php?action=submit_kyc
+Authorization: Bearer TOKEN
 Content-Type: application/json
 ```
 **Request body:**
 ```json
-{
-  "bvn": "12345678901",
-  "nin": "98765432101"
-}
+{ "bvn": "12345678901", "nin": "98765432101" }
 ```
-> At least one of `bvn` or `nin` is required. Both must be exactly 11 digits.
+> At least one of `bvn` or `nin` required. Both exactly 11 digits.
 
 **Response (account generated immediately):**
 ```json
@@ -333,28 +350,21 @@ Content-Type: application/json
   "data": {
     "message": "KYC submitted successfully",
     "account_ready": true,
-    "account_generated": true,
     "acc_no": "8123456789",
     "bank_name": "Palmpay",
     "acc_name": "Usman Musa",
-    "account_number": "8123456789",
-    "account_name": "Usman Musa",
-    "accounts": [
-      { "provider": "PaymentPoint", "bank_name": "Palmpay", "account_number": "8123456789", "account_name": "Usman Musa" },
-      { "provider": "PaymentPoint", "bank_name": "Opay",    "account_number": "9876543210", "account_name": "Usman Musa" }
-    ]
+    "accounts": [ ... ]
   }
 }
 ```
-**Response (account still processing):**
+**Response (still processing):**
 ```json
 {
   "status": "success",
   "data": {
     "message": "KYC submitted successfully",
     "account_ready": false,
-    "setup_message": "Generating your virtual account, please check back shortly.",
-    "account_error": "Connection error: ..."
+    "setup_message": "Generating your virtual account, please check back shortly."
   }
 }
 ```
@@ -364,198 +374,51 @@ Content-Type: application/json
 
 ### `get_kyc_status` — Check KYC & Account Status
 ```
-GET /api.php?action=get_kyc_status&token=TOKEN
+GET /api.php?action=get_kyc_status
+Authorization: Bearer TOKEN
 ```
 **Response:**
 ```json
 {
   "status": "success",
   "data": {
+    "kyc_submitted": true,
     "kyc_complete": true,
     "has_bvn": true,
     "has_nin": false,
     "has_account": true,
-    "needs_bvn": false,
-    "account_ready": true,
-    "account_number": "8123456789",
-    "bank_name": "Palmpay",
-    "account_name": "Usman Musa",
-    "acc_no": "8123456789",
-    "acc_name": "Usman Musa",
-    "accounts": [ ... ],
-    "setup_message": ""
-  }
-}
-```
-
----
-
-### `funding_accounts` — Get Virtual Accounts for Wallet Funding
-```
-GET /api.php?action=funding_accounts&token=TOKEN
-```
-**Response:**
-```json
-{
-  "status": "success",
-  "data": {
-    "has_accounts": true,
-    "has_account": true,
-    "accounts": [
-      { "provider": "PaymentPoint", "bank_name": "Palmpay", "account_number": "8123456789", "account_name": "Usman Musa" },
-      { "provider": "PaymentPoint", "bank_name": "Opay",    "account_number": "9876543210", "account_name": "Usman Musa" }
-    ],
     "acc_no": "8123456789",
     "bank_name": "Palmpay",
     "acc_name": "Usman Musa",
-    "provider": "PaymentPoint",
-    "needs_bvn": false,
-    "setup_message": ""
+    "accounts": [ ... ]
   }
 }
 ```
 
 ---
 
-### `generate_account` — Manually Trigger Account Generation
+### `generate_account` — Generate Virtual Account (after KYC)
 ```
-POST /api.php?action=generate_account&token=TOKEN
+POST /api.php?action=generate_account
+Authorization: Bearer TOKEN
 ```
-> Also accepts `generate_monnify` for backward compatibility.  
-> Requires BVN/NIN to be already saved via `submit_kyc`.
-
-**Response:**
 ```json
-{
-  "status": "success",
-  "data": {
-    "message": "Virtual account generated successfully",
-    "accounts": [ ... ],
-    "acc_no": "8123456789",
-    "bank_name": "Palmpay",
-    "acc_name": "Usman Musa"
-  }
-}
-```
-
----
-
-### `verify_account` — Check If Account Exists
-```
-GET /api.php?action=verify_account&token=TOKEN
-```
-> Also accepts `verify_monnify` for backward compatibility.
-
-**Response:**
-```json
-{
-  "status": "success",
-  "data": {
-    "has_account": true,
-    "accounts": [ ... ],
-    "acc_no": "8123456789",
-    "bank_name": "Palmpay",
-    "acc_name": "Usman Musa"
-  }
-}
-```
-
----
-
-## Airtime & Data
-
-### `buy_airtime` — Purchase Airtime
-```
-POST /api.php?action=buy_airtime&token=TOKEN
-Content-Type: application/json
-```
-**Request body:**
-```json
-{
-  "amount": 200,
-  "number": "08012345678",
-  "network": "mtn",
-  "pin": "1234"
-}
-```
-> `network` values: `mtn` | `airtel` | `glo` | `9mobile` | `etisalat`  
-> Use `"pin": "fingerprint"` for biometric auth.
-
-**Response:**
-```json
-{
-  "status": "success",
-  "data": {
-    "success": true,
-    "message": "Airtime purchased successfully",
-    "balance": 4800.00
-  }
-}
-```
-**Failure (insufficient balance):**
-```json
-{ "status": "error", "message": "Insufficient balance" }
-```
-**Failure (transaction failed, auto-refunded):**
-```json
-{
-  "status": "success",
-  "data": {
-    "success": false,
-    "message": "Transaction failed, wallet refunded",
-    "balance": 5000.00
-  }
-}
-```
-
----
-
-### `buy_data` — Purchase Data
-```
-POST /api.php?action=buy_data&token=TOKEN
-Content-Type: application/json
-```
-**Request body:**
-```json
-{
-  "amount": 300,
-  "number": "08012345678",
-  "serviceID": "mtn-data",
-  "variation": "mtn-1gb-300",
-  "pin": "1234"
-}
-```
-**Response:** Same structure as `buy_airtime`.
-
----
-
-### `data_plans` — Get Available Data Plans
-```
-GET /api.php?action=data_plans&serviceID=mtn-data
-```
-> No auth required. Common `serviceID` values: `mtn-data`, `airtel-data`, `glo-data`, `etisalat-data`
-
-**Response:**
-```json
-{
-  "status": "success",
-  "data": {
-    "plans": [
-      { "plan_id": "mtn-1gb-300", "name": "MTN 1.0GB + 1.0GB Night", "amount": "300" },
-      { "plan_id": "mtn-2gb-500", "name": "MTN 2.0GB",               "amount": "500" }
-    ]
-  }
-}
+{ "status": "success", "data": { "message": "Account generated", "acc_no": "8123456789", "bank_name": "Palmpay", "acc_name": "..." } }
 ```
 
 ---
 
 ## Notifications
 
-### `notifications` / `get_notifications` — Get All Notifications
+### `notifications` — Get User Notifications
 ```
-GET /api.php?action=notifications&token=TOKEN
+GET /api.php?action=notifications
+Authorization: Bearer TOKEN
 ```
+**Query params (optional):**
+- `?page=1` — page number (default 1)
+- `?limit=20` — per page (default 20)
+
 **Response:**
 ```json
 {
@@ -564,95 +427,264 @@ GET /api.php?action=notifications&token=TOKEN
     "notifications": [
       {
         "id": 5,
-        "title": "New Data Deal!",
-        "message": "MTN 1GB for just ₦200",
+        "title": "Wallet Credited ✅",
+        "message": "₦5,000 has been credited to your wallet by John Doe.",
         "type": "success",
-        "target": "all",
-        "created_at": "2026-06-12 08:00:00",
         "is_read": false,
-        "read": false
+        "created_at": "2026-06-13 09:00:00"
       }
     ],
     "unread_count": 3
   }
 }
 ```
-> `type` values: `info` | `success` | `warning` | `danger`
 
 ---
 
-### `get_unread_count` — Badge Count
+### `get_unread_count` — Unread Notification Badge
 ```
-GET /api.php?action=get_unread_count&token=TOKEN
+GET /api.php?action=get_unread_count
+Authorization: Bearer TOKEN
 ```
-**Response:**
 ```json
 { "status": "success", "data": { "unread_count": 3 } }
 ```
+> Also returned in `init` as `unread_count` — no separate call needed on startup.
 
 ---
 
-### `mark_notification_read` — Mark One as Read
+### `mark_notification_read` — Mark One Read
 ```
-POST /api.php?action=mark_notification_read&token=TOKEN
+POST /api.php?action=mark_notification_read
+Authorization: Bearer TOKEN
 Content-Type: application/json
 ```
-**Request body:**
 ```json
 { "notification_id": 5 }
 ```
 **Response:**
 ```json
-{ "status": "success", "data": { "message": "Marked as read" } }
+{ "status": "success", "data": { "message": "Notification marked as read" } }
 ```
 
 ---
 
-### `mark_all_notifications_read` — Mark All as Read
+### `mark_all_notifications_read` — Mark All Read
 ```
-POST /api.php?action=mark_all_notifications_read&token=TOKEN
+POST /api.php?action=mark_all_notifications_read
+Authorization: Bearer TOKEN
 ```
-**Response:**
 ```json
 { "status": "success", "data": { "message": "All notifications marked as read" } }
 ```
 
 ---
 
-## Referral System
+## Referral
 
-### `referral` / `get_referral_stats` — Get Referral Info
+### `referral` / `get_referral_stats` — Referral Stats
 ```
-GET /api.php?action=referral&token=TOKEN
+GET /api.php?action=referral
+Authorization: Bearer TOKEN
 ```
 **Response:**
 ```json
 {
   "status": "success",
   "data": {
-    "referral_code": "md5hash...",
-    "referral_link": "https://rahausub.com.ng/easyfinder/dashboard/register?join_with_referal=md5hash",
+    "referral_code": "3a5a612c02b88c84dfad5d52847767ca",
+    "referral_link": "https://rahausub.com.ng/easyfinder/dashboard/register?join_with_referal=3a5a612c02b88c84dfad5d52847767ca",
     "total_referred": 5,
-    "total_earnings": 500.00,
+    "total_earnings": 750.00,
     "referred_users": [
-      { "sname": "Aisha", "oname": "Bello", "email": "aisha@...", "date_join": "2026-05-01 ..." }
+      { "sname": "Ali", "oname": "Musa", "email": "ali@example.com", "date_join": "2026-05-01" }
     ],
-    "share_message": "Join Rahausub and earn on every data, airtime purchase! Use my referral code: md5hash..."
+    "share_message": "Join Rahausub and earn on every data, airtime purchase! Use my referral code: 3a5a612c02b88c84..."
   }
 }
 ```
 
 ---
 
-## Security / PIN / Fingerprint
+## FCM Push Notifications
 
-### `check_fingerprint` — Check If User Has Fingerprint Enabled
+### `saveDeviceToken.php` — Register Device Token
+```
+POST /saveDeviceToken.php
+Content-Type: application/json
+```
+```json
+{ "email": "user@example.com", "token": "USER_LOGIN_TOKEN", "fcm_token": "FCM_DEVICE_TOKEN", "platform": "android" }
+```
+> Call this after every login and whenever the FCM token refreshes.
+
+---
+
+### `sendPushToUser.php` — Push to Specific User (admin)
+```
+POST /sendPushToUser.php
+Content-Type: application/json
+```
+```json
+{ "admin_key": "RahSubAdmin2026!", "email": "user@example.com", "title": "Hello", "message": "Your wallet has been credited." }
+```
+
+---
+
+### `broadcastNotification.php` — Push to All Users (admin)
+```
+POST /broadcastNotification.php
+Content-Type: application/json
+```
+```json
+{ "admin_key": "RahSubAdmin2026!", "title": "Maintenance", "message": "System will be down at midnight." }
+```
+
+---
+
+## PaymentPoint Webhook
+
+### `webhook.php` — Auto Credit on Payment
+
+**Set this URL in PaymentPoint dashboard:**
+```
+https://api.rahausub.com.ng/webhook.php
+```
+
+When a payment hits a user's virtual account, the webhook automatically:
+1. Verifies HMAC-SHA512 signature
+2. Finds user by account number
+3. Credits wallet balance
+4. Creates in-app notification ("Wallet Credited ✅")
+5. Sends FCM push to all user's devices
+
+**Webhook payload (sent by PaymentPoint):**
+```json
+{
+  "event": "payment.success",
+  "accountNumber": "8123456789",
+  "amount": 5000,
+  "reference": "PP_ref_abc123",
+  "senderName": "John Doe"
+}
+```
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "message": "Payment processed",
+  "email": "user@example.com",
+  "amount": 5000,
+  "new_balance": 5090,
+  "fcm_sent": 1
+}
+```
+
+---
+
+## Services
+
+### `buy_airtime` — Buy Airtime
+```
+POST /api.php?action=buy_airtime
+Authorization: Bearer TOKEN
+Content-Type: application/json
+```
+```json
+{ "network": "MTN", "phone": "08012345678", "amount": 500 }
+```
+
+---
+
+### `buy_data` — Buy Data
+```
+POST /api.php?action=buy_data
+Authorization: Bearer TOKEN
+Content-Type: application/json
+```
+```json
+{ "network": "MTN", "phone": "08012345678", "plan_id": 5, "amount": 300 }
+```
+
+---
+
+### `data_plans` — Get Data Plans
+```
+GET /api.php?action=data_plans&network=MTN
+```
+```json
+{ "status": "success", "data": { "plans": [ { "id": 5, "name": "1GB", "amount": 300, "validity": "30 days" } ] } }
+```
+
+---
+
+### `buy_tv` — Cable TV Subscription
+```
+POST /api.php?action=buy_tv
+Authorization: Bearer TOKEN
+Content-Type: application/json
+```
+```json
+{ "provider": "DSTV", "smart_card": "1234567890", "plan_id": 3, "amount": 8000 }
+```
+
+---
+
+### `buy_electricity` — Electricity / DISCO
+```
+POST /api.php?action=buy_electricity
+Authorization: Bearer TOKEN
+Content-Type: application/json
+```
+```json
+{ "disco": "EKEDC", "meter_no": "12345678901", "meter_type": "prepaid", "amount": 2000, "phone": "08012345678" }
+```
+
+---
+
+## Security / Account
+
+### `set_pin` — Set Transaction PIN
+```
+POST /api.php?action=set_pin
+Authorization: Bearer TOKEN
+Content-Type: application/json
+```
+```json
+{ "pin": "1234" }
+```
+
+---
+
+### `change_pin` — Change Transaction PIN
+```
+POST /api.php?action=change_pin
+Authorization: Bearer TOKEN
+Content-Type: application/json
+```
+```json
+{ "old_pin": "1234", "new_pin": "5678" }
+```
+
+---
+
+### `change_password` — Change Password
+```
+POST /api.php?action=change_password
+Authorization: Bearer TOKEN
+Content-Type: application/json
+```
+```json
+{ "old_password": "OldPass123", "new_password": "NewPass456" }
+```
+
+---
+
+### `check_fingerprint` — Check Fingerprint Status
 ```
 GET /api.php?action=check_fingerprint&email=user@example.com
 ```
-> No auth required. Used before showing fingerprint login button.
-
-**Response:**
 ```json
 { "status": "success", "data": { "finger": true, "email": "user@example.com" } }
 ```
@@ -661,190 +693,39 @@ GET /api.php?action=check_fingerprint&email=user@example.com
 
 ### `toggle_fingerprint` — Enable/Disable Fingerprint
 ```
-POST /api.php?action=toggle_fingerprint&token=TOKEN
+POST /api.php?action=toggle_fingerprint
+Authorization: Bearer TOKEN
 ```
-**Response:**
 ```json
-{ "status": "success", "data": { "finger": true, "message": "Fingerprint enabled" } }
+{ "status": "success", "data": { "finger": true, "message": "Fingerprint login enabled" } }
 ```
-
----
-
-### `set_pin` — Set Transaction PIN
-```
-POST /api.php?action=set_pin&token=TOKEN
-Content-Type: application/json
-```
-**Request body:** `{ "pin": "1234" }` (4–6 digits)
-
-**Response:** `{ "status": "success", "data": { "message": "PIN set successfully" } }`
-
----
-
-### `change_pin` — Change PIN
-```
-POST /api.php?action=change_pin&token=TOKEN
-Content-Type: application/json
-```
-**Request body:** `{ "old_pin": "1234", "new_pin": "5678" }`
-
----
-
-### `change_password` — Change Password
-```
-POST /api.php?action=change_password&token=TOKEN
-Content-Type: application/json
-```
-**Request body:** `{ "old_password": "OldPass", "new_password": "NewPass" }`
-
----
-
-## FCM Push Notifications (Standalone Endpoints)
-
-### `saveDeviceToken.php` — Register FCM Token
-```
-POST https://api.rahausub.com.ng/saveDeviceToken.php
-Content-Type: application/json
-```
-**Request body:**
-```json
-{
-  "token": "USER_AUTH_TOKEN",
-  "fcm_token": "FIREBASE_DEVICE_TOKEN",
-  "platform": "android"
-}
-```
-> Call this after login and whenever FCM token refreshes (onTokenRefresh).  
-> `platform` values: `android` | `ios`
-
-**Response:**
-```json
-{ "success": true, "message": "Token saved" }
-```
-
----
-
-### `broadcastNotification.php` — Push to All Users (Admin Only)
-```
-POST https://api.rahausub.com.ng/broadcastNotification.php
-Content-Type: application/json
-```
-**Request body:**
-```json
-{
-  "admin_key": "RahSubAdmin2026!",
-  "title": "🔥 Flash Sale!",
-  "body": "MTN 1GB for ₦200 today only",
-  "platform": "all",
-  "data": { "screen": "DataPlans" }
-}
-```
-> `platform` values: `all` | `android` | `ios`
-
-**Response:**
-```json
-{ "success": true, "sent": 142, "failed": 3 }
-```
-
----
-
-### `sendPushToUser.php` — Push to Specific User (Admin Only)
-```
-POST https://api.rahausub.com.ng/sendPushToUser.php
-Content-Type: application/json
-```
-**Request body:**
-```json
-{
-  "admin_key": "RahSubAdmin2026!",
-  "email": "user@example.com",
-  "title": "Transaction Complete",
-  "body": "Your wallet has been credited ₦5,000",
-  "data": { "screen": "Wallet" }
-}
-```
-
----
-
-### `webhook.php` — PaymentPoint Webhook (Server-to-Server)
-> Called by PaymentPoint when a user funds their virtual account.  
-> Verifies HMAC signature, credits `wallet_tbl` automatically.
 
 ---
 
 ## Error Responses
 
-All errors follow this format:
+All errors follow the same shape:
 ```json
-{ "status": "error", "message": "Descriptive error message" }
+{ "status": "error", "message": "Human-readable error description" }
 ```
 
 | HTTP Code | Meaning |
 |-----------|---------|
-| `400` | Bad request / validation error |
-| `401` | Unauthorized — invalid or missing token |
-| `404` | Unknown action |
-| `405` | Wrong HTTP method |
-| `409` | Conflict (e.g. BVN already used) |
-| `422` | Unprocessable (e.g. PaymentPoint failed) |
-| `503` | Database unavailable |
+| 400 | Bad request / missing fields |
+| 401 | Missing or invalid token |
+| 404 | Resource not found |
+| 500 | Server error (check logs) |
 
 ---
 
-## Expo / React Native Integration
+## Changelog
 
-```javascript
-const API_BASE = 'https://api.rahausub.com.ng/api.php';
-
-async function apiCall(action, params = {}, token = null) {
-  const url = token ? `${API_BASE}?action=${action}&token=${token}` : `${API_BASE}?action=${action}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
-  });
-  return res.json();
-}
-
-// On app start — verify token
-const status = await apiCall('verify_token', {}, savedToken);
-if (!status.data?.valid) {
-  // Token expired → show login screen
-}
-
-// After login — register FCM token
-import * as Notifications from 'expo-notifications';
-const expoPushToken = (await Notifications.getExpoPushTokenAsync()).data;
-await fetch('https://api.rahausub.com.ng/saveDeviceToken.php', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ token: userAuthToken, fcm_token: expoPushToken, platform: 'android' }),
-});
-
-// KYC flow
-const kyc = await apiCall('get_kyc_status', {}, token);
-if (kyc.data.needs_bvn) {
-  // Show BVN input screen
-  const result = await apiCall('submit_kyc', { bvn: '12345678901' }, token);
-  if (result.data.account_ready) {
-    // Show virtual account numbers
-  } else {
-    // Poll get_kyc_status every 30 seconds
-  }
-}
-```
-
----
-
-## Deployment
-
-| Item | Value |
-|------|-------|
-| Server | premium102.web-hosting.com (cPanel) |
-| API path | `/home/eduowrav/api.rahausub.com.ng/` |
-| Database | `eduowrav_rahausub` |
-| Firebase SA JSON | `/home/eduowrav/firebase_service_account.json` |
-| Firebase Project | `vtu-apps-5c6af` |
-| Payment provider | PaymentPoint (`api.paymentpoint.co`) |
-| Virtual account banks | Palmpay (20946) + Opay (20897) |
-
+| Date | Change |
+|------|--------|
+| Jun 2026 | Add `Authorization: Bearer TOKEN` support — fixes React Native 401 |
+| Jun 2026 | Add `init` endpoint — one call returns full startup data in ~390ms |
+| Jun 2026 | Add 7 DB indexes — eliminates full table scans on every auth request |
+| Jun 2026 | Add `webhook.php` — auto-credits wallet + FCM push on PaymentPoint payment |
+| Jun 2026 | Fix `verify_token` — removed invalid `wallet_balance` column reference (was causing 500 on all auth'd endpoints) |
+| Jun 2026 | Replace Monnify with PaymentPoint throughout `api.php` |
+| Jun 2026 | Add KYC (BVN + NIN), referral system, FCM push, admin notification management |
