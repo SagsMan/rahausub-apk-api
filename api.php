@@ -44,7 +44,7 @@ function verify_token($conn, $incoming_token) {
     // Direct token lookup (current format — plain hex token stored as-is)
     $q = mysqli_query($conn,
         "SELECT id, email, sname, oname, phone, bvn, nin, token, admin_role,
-                super_admin, referal_token, wallet_balance, acc_no, bank_name, acc_name,
+                super_admin, referal_token, acc_no, bank_name, acc_name,
                 acc_no2, bank_name2, acc_name2, pin, finger, password, status
            FROM users_tbl
           WHERE token = '$ts' AND status = 1 LIMIT 1");
@@ -52,7 +52,7 @@ function verify_token($conn, $incoming_token) {
     // Legacy bcrypt fallback (old login.php stored bcrypt hash as token)
     $q2 = mysqli_query($conn,
         "SELECT id, email, sname, oname, phone, bvn, nin, token, admin_role,
-                super_admin, referal_token, wallet_balance, acc_no, bank_name, acc_name,
+                super_admin, referal_token, acc_no, bank_name, acc_name,
                 acc_no2, bank_name2, acc_name2, pin, finger, password, status
            FROM users_tbl
           WHERE token LIKE '\$2y\$%' AND status = 1
