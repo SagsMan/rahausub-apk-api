@@ -41,22 +41,30 @@ function api_error($message, $code = 400) {
 function verify_token($conn, $incoming_token) {
     if (empty($incoming_token)) return null;
     $ts = mysqli_real_escape_string($conn, $incoming_token);
-    // Direct token lookup (current format — plain hex token stored as-is)
+    // Single JOIN — gets user + wallet balance in one round-trip (token col is now indexed)
     $q = mysqli_query($conn,
-        "SELECT id, email, sname, oname, phone, bvn, nin, token, admin_role,
-                super_admin, referal_token, acc_no, bank_name, acc_name,
-                acc_no2, bank_name2, acc_name2, pin, finger, password, status
-           FROM users_tbl
-          WHERE token = '$ts' AND status = 1 LIMIT 1");
+        "SELECT u.id, u.email, u.sname, u.oname, u.phone, u.bvn, u.nin, u.token,
+                u.admin_role, u.super_admin, u.referal_token, u.state,
+                u.acc_no, u.bank_name, u.acc_name,
+                u.acc_no2, u.bank_name2, u.acc_name2,
+                u.pin, u.finger, u.password, u.status,
+                COALESCE(w.balance, 0) AS wallet_balance
+           FROM users_tbl u
+           LEFT JOIN wallet_tbl w ON w.user_id = u.email
+          WHERE u.token = '$ts' AND u.status = 1 LIMIT 1");
     if ($q && mysqli_num_rows($q) > 0) return mysqli_fetch_assoc($q);
     // Legacy bcrypt fallback (old login.php stored bcrypt hash as token)
     $q2 = mysqli_query($conn,
-        "SELECT id, email, sname, oname, phone, bvn, nin, token, admin_role,
-                super_admin, referal_token, acc_no, bank_name, acc_name,
-                acc_no2, bank_name2, acc_name2, pin, finger, password, status
-           FROM users_tbl
-          WHERE token LIKE '\$2y\$%' AND status = 1
-          ORDER BY id DESC LIMIT 200");
+        "SELECT u.id, u.email, u.sname, u.oname, u.phone, u.bvn, u.nin, u.token,
+                u.admin_role, u.super_admin, u.referal_token, u.state,
+                u.acc_no, u.bank_name, u.acc_name,
+                u.acc_no2, u.bank_name2, u.acc_name2,
+                u.pin, u.finger, u.password, u.status,
+                COALESCE(w.balance, 0) AS wallet_balance
+           FROM users_tbl u
+           LEFT JOIN wallet_tbl w ON w.user_id = u.email
+          WHERE u.token LIKE '\$2y\$%' AND u.status = 1
+          ORDER BY u.id DESC LIMIT 200");
     if ($q2) {
         while ($row = mysqli_fetch_assoc($q2)) {
             if (password_verify($incoming_token, $row['token'])) return $row;
@@ -329,42 +337,48 @@ case 'register':
     api_response(['message' => 'Registration successful. Please submit your BVN/NIN via the KYC section to activate your virtual account.']);
     break;
 
-// ── PROFILE ───────────────────────────────────────────────────────────────────
+// ── INIT (fast startup — 1 query total, returns everything the app needs) ─────
+case 'init':
 case 'profile':
-    $user = require_auth($conn);
-    $em   = mysqli_real_escape_string($conn, $user['email']);
-
-    // Refresh user data
-    $uq = mysqli_query($conn, "SELECT * FROM users_tbl WHERE email='$em' LIMIT 1");
-    if ($uq) $user = mysqli_fetch_assoc($uq) ?: $user;
-
-    $wq  = mysqli_query($conn, "SELECT balance FROM wallet_tbl WHERE user_id = '$em' LIMIT 1");
-    $bal = ($wq && mysqli_num_rows($wq) > 0) ? floatval(mysqli_fetch_assoc($wq)['balance']) : 0;
-
+    $user     = require_auth($conn);   // already does user+wallet JOIN in one query
     $accounts = pp_get_accounts($user);
     $primary  = $accounts[0] ?? null;
+    $bal      = floatval($user['wallet_balance'] ?? 0);
 
+    // Unread notification count — single indexed query
+    $em  = mysqli_real_escape_string($conn, $user['email']);
+    $nq  = mysqli_query($conn,
+        "SELECT COUNT(*) AS cnt FROM notifications_tbl
+          WHERE status = 1
+            AND (target = 'all' OR target_email = '$em')
+            AND (is_read_by NOT LIKE '%\"$em\"%')");
+    $unread = ($nq) ? intval(mysqli_fetch_assoc($nq)['cnt']) : 0;
+
+    header('Cache-Control: no-store');   // fresh every call — wallet balance changes
     api_response([
-        'id'             => $user['id'],
-        'email'          => $user['email'],
-        'sname'          => $user['sname'],
-        'oname'          => $user['oname'],
-        'phone'          => $user['phone'],
-        'state'          => $user['state'] ?? '',
-        'admin_role'     => $user['admin_role'] ?? 0,
-        'super_admin'    => $user['super_admin'] ?? 0,
-        'referral_code'  => $user['referal_token'] ?? '',
-        'referral_link'  => 'https://rahausub.com.ng/easyfinder/dashboard/register?join_with_referal=' . ($user['referal_token'] ?? ''),
-        'wallet_balance' => $bal,
-        'has_account'    => !empty($accounts),
-        'acc_no'         => $primary['account_number'] ?? '',
-        'bank_name'      => $primary['bank_name'] ?? '',
-        'acc_name'       => $primary['account_name'] ?? '',
-        'accounts'       => $accounts,
-        'bvn'            => !empty($user['bvn']) ? '****' . substr($user['bvn'], -4) : null,
-        'has_bvn'        => !empty($user['bvn']),
-        'has_nin'        => !empty($user['nin']),
-        'kyc_complete'   => (!empty($user['bvn']) || !empty($user['nin'])),
+        'id'              => $user['id'],
+        'email'           => $user['email'],
+        'sname'           => $user['sname'],
+        'oname'           => $user['oname'],
+        'phone'           => $user['phone'],
+        'state'           => $user['state'] ?? '',
+        'admin_role'      => $user['admin_role'] ?? 0,
+        'super_admin'     => $user['super_admin'] ?? 0,
+        'referral_code'   => $user['referal_token'] ?? '',
+        'referral_link'   => 'https://rahausub.com.ng/easyfinder/dashboard/register?join_with_referal=' . ($user['referal_token'] ?? ''),
+        'wallet_balance'  => $bal,
+        'has_account'     => !empty($accounts),
+        'acc_no'          => $primary['account_number'] ?? '',
+        'bank_name'       => $primary['bank_name'] ?? '',
+        'acc_name'        => $primary['account_name'] ?? '',
+        'accounts'        => $accounts,
+        'unread_count'    => $unread,
+        'bvn'             => !empty($user['bvn']) ? '****' . substr($user['bvn'], -4) : null,
+        'has_bvn'         => !empty($user['bvn']),
+        'has_nin'         => !empty($user['nin']),
+        'kyc_complete'    => (!empty($user['bvn']) || !empty($user['nin'])),
+        'finger'          => (bool)(int)($user['finger'] ?? 0),
+        'haspin'          => !empty($user['pin']),
     ]);
     break;
 
