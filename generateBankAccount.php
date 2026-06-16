@@ -211,4 +211,3 @@ function generateBankAccount($email, $name, $phone){
 }
 
 ?>
-?>
