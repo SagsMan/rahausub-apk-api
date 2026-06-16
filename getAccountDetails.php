@@ -98,8 +98,8 @@ if (!$email) {
     exit;
 }
 
-// 🔍 Check if account already exists
-$stmt = $conn->prepare("SELECT acc_no, bank_name, acc_name FROM users_tbl WHERE email = ?");
+// 🔍 Check existing accounts (both slots)
+$stmt = $conn->prepare("SELECT acc_no, bank_name, acc_name, acc_no2, bank_name2, acc_name2 FROM users_tbl WHERE email = ?");
 
 if (!$stmt) {
 
@@ -115,30 +115,38 @@ $stmt->bind_param("s", $email);
 $stmt->execute();
 
 $result = $stmt->get_result();
-
 $user = $result->fetch_assoc();
 
-// ✅ Already exists
-if (!empty($user['acc_no'])) {
+$hasAcc1 = !empty($user['acc_no']);
+$hasAcc2 = !empty($user['acc_no2']);
 
-    apiLog("Account already exists", [
-        "email" => $email,
-        "account_number" => $user['acc_no']
-    ]);
+// ✅ At least one account already exists — return both
+if ($hasAcc1) {
+
+    apiLog("Account(s) already exist", ["email" => $email]);
 
     $response['success'] = true;
+
+    // Primary account
     $response['account_number'] = $user['acc_no'];
-    $response['bank_name'] = $user['bank_name'];
-    $response['account_name'] = $user['acc_name'];
+    $response['bank_name']      = $user['bank_name'];
+    $response['account_name']   = $user['acc_name'];
+
+    // Secondary account (Opay / second bank)
+    if ($hasAcc2) {
+        $response['account_number2'] = $user['acc_no2'];
+        $response['bank_name2']      = $user['bank_name2'];
+        $response['account_name2']   = $user['acc_name2'];
+    }
 
     echo json_encode($response);
     exit;
 }
 
-// 🚀 Create new account
+// 🚀 Create new virtual account(s)
 apiLog("Creating virtual account", [
     "email" => $email,
-    "name" => $fullName,
+    "name"  => $fullName,
     "phone" => $phone
 ]);
 
@@ -156,7 +164,7 @@ if (!$create['success']) {
 }
 
 // 🔁 Fetch again after creation
-$stmt = $conn->prepare("SELECT acc_no, bank_name, acc_name FROM users_tbl WHERE email = ?");
+$stmt = $conn->prepare("SELECT acc_no, bank_name, acc_name, acc_no2, bank_name2, acc_name2 FROM users_tbl WHERE email = ?");
 
 if (!$stmt) {
 
@@ -172,14 +180,11 @@ $stmt->bind_param("s", $email);
 $stmt->execute();
 
 $result = $stmt->get_result();
-
 $user = $result->fetch_assoc();
 
 if (!$user || empty($user['acc_no'])) {
 
-    apiLog("Account creation succeeded but no account found after fetch", [
-        "email" => $email
-    ]);
+    apiLog("Account creation succeeded but no account found after fetch", ["email" => $email]);
 
     $response['message'] = "Account created but retrieval failed";
 
@@ -187,17 +192,23 @@ if (!$user || empty($user['acc_no'])) {
     exit;
 }
 
-// ✅ Return new account
+// ✅ Return newly created account(s)
 apiLog("Account created successfully", [
-    "email" => $email,
+    "email"          => $email,
     "account_number" => $user['acc_no'],
-    "bank_name" => $user['bank_name']
+    "bank_name"      => $user['bank_name']
 ]);
 
-$response['success'] = true;
+$response['success']        = true;
 $response['account_number'] = $user['acc_no'];
-$response['bank_name'] = $user['bank_name'];
-$response['account_name'] = $user['acc_name'];
+$response['bank_name']      = $user['bank_name'];
+$response['account_name']   = $user['acc_name'];
+
+if (!empty($user['acc_no2'])) {
+    $response['account_number2'] = $user['acc_no2'];
+    $response['bank_name2']      = $user['bank_name2'];
+    $response['account_name2']   = $user['acc_name2'];
+}
 
 echo json_encode($response);
 ?>
