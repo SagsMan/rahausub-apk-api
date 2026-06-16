@@ -67,7 +67,14 @@ function verify_token($conn, $incoming_token) {
           ORDER BY u.id DESC LIMIT 200");
     if ($q2) {
         while ($row = mysqli_fetch_assoc($q2)) {
-            if (password_verify($incoming_token, $row['token'])) return $row;
+            if (password_verify($incoming_token, $row['token'])) {
+                // Upgrade bcrypt token to raw for instant lookups going forward
+                $upgradeToken = bin2hex(random_bytes(32));
+                $upgradeSafe  = mysqli_real_escape_string($conn, $upgradeToken);
+                mysqli_query($conn, "UPDATE users_tbl SET token='$upgradeSafe' WHERE id=" . intval($row['id']));
+                $row['token'] = $upgradeToken;
+                return $row;
+            }
         }
     }
     return null;
@@ -126,7 +133,7 @@ function pp_create_account($conn, $email, $name, $phone) {
             'Content-Type: application/json',
             'api-key: ' . $apiKey,
         ],
-        CURLOPT_TIMEOUT        => 60,
+        CURLOPT_TIMEOUT        => 10,
         CURLOPT_SSL_VERIFYPEER => false,
     ]);
     $response  = curl_exec($ch);
@@ -609,44 +616,42 @@ case 'submit_kyc':
     if (empty($sets)) api_error('BVN and NIN must be 11 digits');
     mysqli_query($conn, "UPDATE users_tbl SET " . implode(', ', $sets) . " WHERE email='$em'");
 
-    // Attempt to auto-generate virtual account via PaymentPoint
-    $ppResult = null;
-    $uq = mysqli_query($conn, "SELECT * FROM users_tbl WHERE email='$em' LIMIT 1");
+    // Fetch fresh user to check current account state
+    $uq       = mysqli_query($conn, "SELECT * FROM users_tbl WHERE email='$em' LIMIT 1");
     $freshUser = $uq ? (mysqli_fetch_assoc($uq) ?: $user) : $user;
-
-    if (empty($freshUser['acc_no'])) {
-        $fullName = trim(($freshUser['sname'] ?? '') . ' ' . ($freshUser['oname'] ?? ''));
-        $ppResult = pp_create_account($conn, $freshUser['email'], $fullName, $freshUser['phone'] ?? '');
-    }
-
-    // Re-fetch after account generation
-    $uq2  = mysqli_query($conn, "SELECT * FROM users_tbl WHERE email='$em' LIMIT 1");
-    $fresh = $uq2 ? (mysqli_fetch_assoc($uq2) ?: $freshUser) : $freshUser;
-    $hasBvnNow = !empty($fresh['bvn']);
-    $hasNinNow = !empty($fresh['nin']);
-    $accounts  = pp_get_accounts($fresh);
+    $accounts  = pp_get_accounts($freshUser);
     $primary   = $accounts[0] ?? null;
+    $needsAcct = empty($freshUser['acc_no']);
 
-    $responseData = [
-        'message'         => 'KYC submitted successfully',
-        'needs_bvn'       => !$hasBvnNow && !$hasNinNow,
-        'setup_message'   => !empty($accounts) ? '' : 'Generating your virtual account, please check back shortly.',
-        'account_ready'   => !empty($accounts),
-        'accounts'        => $accounts,
-        'acc_no'          => $primary['account_number'] ?? '',
-        'bank_name'       => $primary['bank_name'] ?? '',
-        'acc_name'        => $primary['account_name'] ?? '',
-    ];
+    // ── Respond to user IMMEDIATELY — do not wait for PaymentPoint API ────────
+    http_response_code(200);
+    echo json_encode(['status' => 'success', 'data' => [
+        'message'       => 'KYC submitted successfully',
+        'needs_bvn'     => empty($freshUser['bvn']) && empty($freshUser['nin']),
+        'account_ready' => !$needsAcct,
+        'setup_message' => $needsAcct
+            ? 'Your virtual account is being generated, please check the KYC status in a moment.'
+            : '',
+        'accounts'      => $accounts,
+        'acc_no'        => $primary['account_number'] ?? '',
+        'bank_name'     => $primary['bank_name'] ?? '',
+        'acc_name'      => $primary['account_name'] ?? '',
+    ]]);
 
-    if ($ppResult && $ppResult['success']) {
-        $responseData['account_generated'] = true;
-        $responseData['account_number']    = $primary['account_number'] ?? '';
-        $responseData['account_name']      = $primary['account_name'] ?? '';
-    } elseif ($ppResult && !$ppResult['success']) {
-        $responseData['account_error'] = $ppResult['message'] ?? 'Account generation failed';
+    // Flush response to client before the slow PaymentPoint call
+    if (function_exists('fastcgi_finish_request')) {
+        fastcgi_finish_request();
+    } else {
+        if (ob_get_level() > 0) { ob_flush(); }
+        flush();
     }
 
-    api_response($responseData);
+    // Generate virtual account in background — client already received response
+    if ($needsAcct) {
+        $fullName = trim(($freshUser['sname'] ?? '') . ' ' . ($freshUser['oname'] ?? ''));
+        pp_create_account($conn, $freshUser['email'], $fullName, $freshUser['phone'] ?? '');
+    }
+    exit;
     break;
 
 // ── GET KYC STATUS ────────────────────────────────────────────────────────────
